@@ -1,0 +1,14 @@
+{
+  "name": "agentscape-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/agent.js && node --check src/source_3d_asset.js && node --check experiments/source_3d_asset.mjs && node --test",
+    "experiment:source3d": "node experiments/source_3d_asset.mjs"
+  }
+}

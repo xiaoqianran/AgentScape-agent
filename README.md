@@ -1,0 +1,72 @@
+# AgentScape-agent
+
+`AgentScape-agent` 是 AgentScape 系统的 **Agentic Orchestration Caller**。它不拥有 Provider、Artifact Store、Asset 真值或 WorldRuntime；它只拥有 Agent Run、决策、Skill workflow 与调用证据。
+
+## 代码原则
+
+```text
+Experiment
+   ↓
+Vertical Slice
+   ↓
+Single-file First
+   ↓
+Functional Core / Imperative Shell
+   ↓
+Contract + Evidence
+   ↓
+出现真实 Pressure 才 Extract
+```
+
+第一条 Vertical Slice 是 `source_3d_asset`：
+
+```text
+Text
+  ↓
+generate N images ──► modal-2D-client
+  ↓
+VLM evaluate / select
+  ↓
+generate 3D ────────► modal-3D-client
+  ↓
+publish Asset ──────► AgentScape
+```
+
+当前代码把 `decideSource3DAsset()` 保持为纯函数；HTTP、Modal Sidecar、VLM 等副作用只存在于 Imperative Shell / Adapter。没有 `service/repository/manager/factory` 横向层。
+
+## 验证
+
+```bash
+npm test
+npm run check
+```
+
+真实候选生成实验：
+
+```bash
+MODAL_2D_AGENT_TOKEN=... npm run experiment:source3d
+```
+
+如果同时提供 `AGENTSCAPE_LLM_BASE_URL / AGENTSCAPE_LLM_API_KEY / AGENTSCAPE_LLM_MODEL`，实验会继续执行真实 multimodal VLM ranking；没有凭据时会明确记录 `ranking.status=skipped`，不会伪造结果。
+
+## Verified baseline
+
+2026-08-27 已用正在运行的真实 `modal-2D-client` 执行第一条实验：
+
+```text
+prompt → modal-2D-client → modal-2D
+       → 4 image candidates
+```
+
+结果：
+
+```text
+model      sana-sprint-1.6b
+seeds      42 / 73 / 104 / 135
+candidates 4/4 succeeded
+elapsed    63672 ms
+digests    4 distinct SHA-256
+ranking    skipped (LLM credentials not configured)
+```
+
+这条 baseline 只证明“真实候选生成”已经稳定，不把未执行的 VLM ranking 伪装成成功。
