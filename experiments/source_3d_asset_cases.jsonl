@@ -1,0 +1,5 @@
+{"id":"happy-apple","prompt":"a red apple","fault":null,"expected":{"phase":"done","effects":["generate_images","evaluate_images","generate_3d","publish_asset"],"maxEffects":4}}
+{"id":"image-provider-failure","prompt":"a wooden chair","fault":"generate_images","expected":{"phase":"failed","errorCode":"image_provider_unavailable","effects":["generate_images"],"maxEffects":1}}
+{"id":"vlm-invented-candidate","prompt":"a blue mug","fault":"evaluate_images_unknown","expected":{"phase":"failed","errorCode":"workflow_invariant_failed","effects":["generate_images","evaluate_images"],"maxEffects":2}}
+{"id":"3d-provider-failure","prompt":"a green plant pot","fault":"generate_3d","expected":{"phase":"failed","errorCode":"provider_unavailable","effects":["generate_images","evaluate_images","generate_3d"],"maxEffects":3}}
+{"id":"asset-publish-failure","prompt":"a desk lamp","fault":"publish_asset","expected":{"phase":"failed","errorCode":"asset_admission_failed","effects":["generate_images","evaluate_images","generate_3d","publish_asset"],"maxEffects":4}}

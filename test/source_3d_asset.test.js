@@ -103,6 +103,26 @@ test('imperative shell composes effects while the core remains provider-neutral'
   ]);
 });
 
+test('imperative shell turns invalid effect results into explicit invariant failure', async () => {
+  const images = [candidate('known')];
+  const result = await runSource3DAsset(
+    { prompt: 'red apple', candidateCount: 1 },
+    {
+      async generateImages() { return images; },
+      async evaluateImages() { return { selectedId: 'invented', reason: 'bad evaluator output' }; },
+      async generate3D() {},
+      async publishAsset() {}
+    }
+  );
+  assert.equal(result.state.phase, 'failed');
+  assert.deepEqual(result.state.error, {
+    code: 'workflow_invariant_failed',
+    message: 'unknown selected candidate: invented',
+    retryable: false
+  });
+  assert.equal(result.trace.at(-1).causedBy, 'candidate_selected');
+});
+
 test('imperative shell turns effect errors into explicit failed state', async () => {
   const result = await runSource3DAsset(
     { prompt: 'red apple' },

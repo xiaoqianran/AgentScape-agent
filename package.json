@@ -8,7 +8,8 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/agent.js && node --check src/source_3d_asset.js && node --check experiments/source_3d_asset.mjs && node --test",
-    "experiment:source3d": "node experiments/source_3d_asset.mjs"
+    "check": "node --check src/agent.js && node --check src/source_3d_asset.js && node --check experiments/source_3d_asset.mjs && node --check experiments/source_3d_asset_eval.mjs && node --test && node experiments/source_3d_asset_eval.mjs",
+    "experiment:source3d": "node experiments/source_3d_asset.mjs",
+    "eval:source3d": "node experiments/source_3d_asset_eval.mjs"
   }
 }

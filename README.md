@@ -70,3 +70,31 @@ ranking    skipped (LLM credentials not configured)
 ```
 
 这条 baseline 只证明“真实候选生成”已经稳定，不把未执行的 VLM ranking 伪装成成功。
+
+## Replay / Evaluation Gate
+
+除了真实 Provider Experiment，本仓还保留 deterministic replay，用来防止 Agent/Workflow 改动产生轨迹回退：
+
+```text
+npm run eval:source3d
+```
+
+当前 `source_3d_asset-replay-v1` 覆盖：
+
+```text
+happy path                PASS
+image provider failure    PASS
+VLM invented candidate    PASS
+3D provider failure       PASS
+Asset admission failure   PASS
+```
+
+每个 case 同时检查：
+
+```text
+Outcome      最终 phase / error code
+Trajectory   Event → Effect 顺序
+Efficiency   Effect count 不超过预算
+```
+
+Replay 不替代真实 Provider Experiment；两者分别回答“业务逻辑有没有漂移”和“外部能力今天是否真的能工作”。

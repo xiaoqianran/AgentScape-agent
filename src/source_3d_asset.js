@@ -128,11 +128,40 @@ export async function runSource3DAsset(request, deps) {
   const trace = [];
 
   while (!TERMINAL_PHASES.has(state.phase)) {
-    const transition = decideSource3DAsset(state, event);
+    let transition;
+    try {
+      transition = decideSource3DAsset(state, event);
+    } catch (error) {
+      const failedEvent = {
+        type: 'failed',
+        code: error?.code ?? 'workflow_invariant_failed',
+        message: error instanceof Error ? error.message : String(error),
+        retryable: false
+      };
+      transition = decideSource3DAsset(state, failedEvent);
+      state = transition.state;
+      trace.push({
+        event: failedEvent.type,
+        causedBy: event.type,
+        phase: state.phase,
+        effects: [],
+        code: failedEvent.code
+      });
+      break;
+    }
+
     state = transition.state;
     trace.push({ event: event.type, phase: state.phase, effects: transition.effects.map(({ type }) => type) });
     if (transition.effects.length === 0) break;
-    if (transition.effects.length !== 1) throw new Error('source_3d_asset currently requires one effect per transition');
+    if (transition.effects.length !== 1) {
+      event = {
+        type: 'failed',
+        code: 'workflow_invariant_failed',
+        message: 'source_3d_asset currently requires one effect per transition',
+        retryable: false
+      };
+      continue;
+    }
 
     try {
       event = await executeEffect(transition.effects[0], state, resources, deps);
@@ -146,11 +175,6 @@ export async function runSource3DAsset(request, deps) {
     }
   }
 
-  if (event.type === 'failed' && !TERMINAL_PHASES.has(state.phase)) {
-    const transition = decideSource3DAsset(state, event);
-    state = transition.state;
-    trace.push({ event: event.type, phase: state.phase, effects: [] });
-  }
   return { state, trace };
 }
 
