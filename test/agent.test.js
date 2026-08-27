@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { runAgent, toolDefinitions } from '../src/agent.js';
 
 const sourceTool = (execute) => ({
@@ -93,4 +94,93 @@ test('tool definitions do not leak execute functions into the model schema', () 
   assert.equal(definitions.length, 1);
   assert.equal(typeof definitions[0].description, 'string');
   assert.equal('execute' in definitions[0], false);
+});
+
+import { createOpenAICompatibleAgentGateway } from '../src/agent.js';
+import { createSource3DAssetTool } from '../src/source_3d_asset.js';
+
+test('OpenAI-compatible agent gateway serializes tools and parses tool calls fail-closed', async () => {
+  let upstreamBody;
+  const gateway = createOpenAICompatibleAgentGateway({
+    baseUrl: 'https://llm.example/v1',
+    apiKey: 'test-key',
+    model: 'agent-model',
+    fetchImpl: async (_url, init) => {
+      upstreamBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: null,
+            tool_calls: [{
+              id: 'call-1',
+              type: 'function',
+              function: { name: 'source_3d_asset', arguments: '{"prompt":"red apple"}' }
+            }]
+          }
+        }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+  });
+
+  const response = await gateway({
+    messages: [{ role: 'user', content: 'make an apple' }],
+    tools: [{ name: 'source_3d_asset', description: 'source asset', parameters: { type: 'object' } }]
+  });
+  assert.deepEqual(response.toolCalls, [{ id: 'call-1', name: 'source_3d_asset', args: { prompt: 'red apple' } }]);
+  assert.equal(upstreamBody.tool_choice, 'auto');
+  assert.equal(upstreamBody.tools[0].function.name, 'source_3d_asset');
+});
+
+test('OpenAI-compatible agent gateway rejects malformed tool arguments', async () => {
+  const gateway = createOpenAICompatibleAgentGateway({
+    baseUrl: 'https://llm.example/v1',
+    apiKey: 'test-key',
+    model: 'agent-model',
+    fetchImpl: async () => new Response(JSON.stringify({
+      choices: [{ message: { tool_calls: [{ id: 'x', function: { name: 'source_3d_asset', arguments: '{broken' } }] } }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } })
+  });
+  await assert.rejects(
+    () => gateway({ messages: [], tools: [] }),
+    /Invalid JSON arguments for tool source_3d_asset/
+  );
+});
+
+test('Agent can invoke source_3d_asset as one deep high-level tool', async () => {
+  const image = Buffer.from('image');
+  const sourceTool = createSource3DAssetTool({
+    async generateImages() {
+      return [{
+        id: 'img-1',
+        mediaType: 'image/png',
+        bytes: image.length,
+        sha256: createHash('sha256').update(image).digest('hex'),
+        data: image
+      }];
+    },
+    async evaluateImages() {
+      return { selectedId: 'img-1', reason: 'only candidate' };
+    },
+    async generate3D() {
+      return { id: 'glb-1', mediaType: 'model/gltf-binary', bytes: 12, sha256: 'a'.repeat(64), data: Buffer.from('glb') };
+    },
+    async publishAsset() {
+      return { id: 'asset-1', status: 'ready' };
+    }
+  });
+  let step = 0;
+  const result = await runAgent({
+    task: 'make a red apple asset',
+    tools: { source_3d_asset: sourceTool },
+    gateway: async ({ messages }) => {
+      step += 1;
+      if (step === 1) return { message: '', toolCalls: [{ id: 'call-1', name: 'source_3d_asset', args: { prompt: 'red apple', candidateCount: 1 } }] };
+      const observation = JSON.parse(messages.at(-1).content);
+      assert.equal(observation.result.asset.id, 'asset-1');
+      assert.equal(observation.result.selectedId, 'img-1');
+      return { message: 'asset ready', toolCalls: [] };
+    }
+  });
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(result.trace.map(({ type }) => type), ['tool', 'final']);
 });

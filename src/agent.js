@@ -93,3 +93,87 @@ export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPromp
     trace
   };
 }
+
+function toOpenAIMessages(messages) {
+  return messages.map((message) => {
+    if (message.role === 'assistant' && Array.isArray(message.toolCalls) && message.toolCalls.length > 0) {
+      return {
+        role: 'assistant',
+        content: message.content || null,
+        tool_calls: message.toolCalls.map((call, index) => ({
+          id: call.id ?? `call_${index + 1}`,
+          type: 'function',
+          function: {
+            name: requireText(call.name, 'assistant tool call name'),
+            arguments: JSON.stringify(call.args ?? {})
+          }
+        }))
+      };
+    }
+    if (message.role === 'tool') {
+      return {
+        role: 'tool',
+        tool_call_id: requireText(message.toolCallId, 'toolCallId'),
+        content: String(message.content ?? '')
+      };
+    }
+    return { role: message.role, content: String(message.content ?? '') };
+  });
+}
+
+function parseToolArguments(value, name) {
+  try {
+    const parsed = JSON.parse(value || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new TypeError('arguments must be an object');
+    return parsed;
+  } catch (error) {
+    throw new Error(`Invalid JSON arguments for tool ${name}: ${error.message}`);
+  }
+}
+
+export function createOpenAICompatibleAgentGateway({ baseUrl, apiKey, model, fetchImpl = fetch } = {}) {
+  const endpoint = requireText(baseUrl, 'baseUrl').replace(/\/$/, '');
+  const key = requireText(apiKey, 'apiKey');
+  const modelName = requireText(model, 'model');
+
+  return async ({ messages, tools }) => {
+    if (!Array.isArray(messages)) throw new TypeError('messages are required');
+    if (!Array.isArray(tools)) throw new TypeError('tools are required');
+    const response = await fetchImpl(`${endpoint}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: modelName,
+        temperature: 0,
+        stream: false,
+        tool_choice: 'auto',
+        messages: toOpenAIMessages(messages),
+        tools: tools.map((tool) => ({
+          type: 'function',
+          function: {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters
+          }
+        }))
+      })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(`Agent LLM request failed with HTTP ${response.status}: ${payload.error?.message ?? response.statusText}`);
+    const message = payload.choices?.[0]?.message;
+    if (!message || typeof message !== 'object') throw new Error('Agent LLM returned no message');
+    const toolCalls = (message.tool_calls ?? []).map((call, index) => {
+      const name = requireText(call?.function?.name, 'tool call name');
+      return {
+        id: call.id ?? `call_${index + 1}`,
+        name,
+        args: parseToolArguments(call.function.arguments, name)
+      };
+    });
+    return {
+      message: typeof message.content === 'string' ? message.content : '',
+      final: toolCalls.length === 0,
+      toolCalls
+    };
+  };
+}

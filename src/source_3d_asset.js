@@ -313,3 +313,35 @@ export function createOpenAICompatibleVisionRanker({ baseUrl, apiKey, model, fet
     }
   };
 }
+
+export function createSource3DAssetTool(deps) {
+  return {
+    description: 'Source or generate a reusable 3D asset from a text description. The workflow may generate image candidates, evaluate them, generate 3D, verify it, and publish an Asset.',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', minLength: 1 },
+        candidateCount: { type: 'integer', minimum: 1, maximum: 8, default: 4 }
+      },
+      required: ['prompt'],
+      additionalProperties: false
+    },
+    async execute({ prompt, candidateCount = 4 }) {
+      const result = await runSource3DAsset({ prompt, candidateCount }, deps);
+      if (result.state.phase === 'failed') {
+        const error = new Error(result.state.error.message);
+        error.code = result.state.error.code;
+        error.retryable = result.state.error.retryable;
+        throw error;
+      }
+      if (result.state.phase !== 'done') throw new Error(`source_3d_asset ended in unexpected phase: ${result.state.phase}`);
+      return {
+        asset: result.state.asset,
+        artifact: result.state.artifact,
+        selectedId: result.state.selectedId,
+        candidates: result.state.candidates,
+        trace: result.trace
+      };
+    }
+  };
+}
