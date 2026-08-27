@@ -98,3 +98,19 @@ Efficiency   Effect count 不超过预算
 ```
 
 Replay 不替代真实 Provider Experiment；两者分别回答“业务逻辑有没有漂移”和“外部能力今天是否真的能工作”。
+
+## Agent Run Checkpoint
+
+`src/runs.js` 是当前唯一允许独立拆出的状态模块，因为 Agent Run 有独立的持久化/故障恢复生命周期。第一版只做原子 checkpoint，不自动重放 Tool：
+
+```text
+Agent step
+   ↓
+messages + trace + status
+   ↓
+0600 JSON temp file
+   ↓ atomic rename
+run_<id>.json
+```
+
+如果 checkpoint 写入失败，Agent 立即停止，避免“模型继续执行但 durable evidence 已丢失”。真正的 resume 要等所有 Tool 都具有稳定 request identity / idempotency 后再开启。

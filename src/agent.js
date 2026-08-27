@@ -3,6 +3,37 @@ function requireText(value, name) {
   return value.trim();
 }
 
+function assertObservationSafe(value, path = 'result', seen = new Set()) {
+  if (value == null || ['string', 'number', 'boolean'].includes(typeof value)) return;
+  if (Buffer.isBuffer(value) || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+    const error = new TypeError(`Tool observation must not contain binary payloads: ${path}`);
+    error.code = 'tool_result_not_serializable';
+    throw error;
+  }
+  if (typeof value !== 'object') {
+    const error = new TypeError(`Tool observation contains unsupported value at ${path}`);
+    error.code = 'tool_result_not_serializable';
+    throw error;
+  }
+  if (seen.has(value)) {
+    const error = new TypeError(`Tool observation contains a cycle at ${path}`);
+    error.code = 'tool_result_not_serializable';
+    throw error;
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertObservationSafe(item, `${path}[${index}]`, seen));
+  } else {
+    for (const [key, item] of Object.entries(value)) assertObservationSafe(item, `${path}.${key}`, seen);
+  }
+  seen.delete(value);
+}
+
+function serializeToolObservation(value) {
+  assertObservationSafe(value);
+  return JSON.stringify(value);
+}
+
 function normalizeTools(tools) {
   if (!tools || typeof tools !== 'object' || Array.isArray(tools)) throw new TypeError('tools must be an object');
   return Object.fromEntries(Object.entries(tools).map(([name, tool]) => {
@@ -24,9 +55,10 @@ export function toolDefinitions(tools) {
   }));
 }
 
-export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPrompt } = {}) {
+export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPrompt, checkpoint } = {}) {
   const userTask = requireText(task, 'task');
   if (typeof gateway !== 'function') throw new TypeError('gateway is required');
+  if (checkpoint != null && typeof checkpoint !== 'function') throw new TypeError('checkpoint must be a function');
   if (!Number.isInteger(maxSteps) || maxSteps < 1 || maxSteps > 32) throw new RangeError('maxSteps must be between 1 and 32');
   const normalizedTools = normalizeTools(tools);
   const definitions = toolDefinitions(normalizedTools);
@@ -47,7 +79,16 @@ export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPromp
 
     if (toolCalls.length === 0) {
       trace.push({ step, type: 'final', message });
-      return { status: 'completed', message, steps: step, trace };
+      const result = { status: 'completed', message, steps: step, trace };
+      await checkpoint?.({
+        status: result.status,
+        task: userTask,
+        step,
+        message,
+        messages: structuredClone(messages),
+        trace: structuredClone(trace)
+      });
+      return result;
     }
 
     messages.push({
@@ -68,8 +109,10 @@ export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPromp
 
       const args = call.args && typeof call.args === 'object' && !Array.isArray(call.args) ? call.args : {};
       let result;
+      let content;
       try {
         result = { success: true, result: await tool.execute(args) };
+        content = serializeToolObservation(result);
         trace.push({ step, type: 'tool', name, success: true });
       } catch (error) {
         result = {
@@ -80,18 +123,36 @@ export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPromp
             retryable: Boolean(error?.retryable)
           }
         };
+        content = JSON.stringify(result);
         trace.push({ step, type: 'tool', name, success: false, code: result.error.code });
       }
-      messages.push({ role: 'tool', toolCallId: call.id ?? null, name, content: JSON.stringify(result) });
+      messages.push({ role: 'tool', toolCallId: call.id ?? null, name, content });
     }
+
+    await checkpoint?.({
+      status: 'running',
+      task: userTask,
+      step,
+      messages: structuredClone(messages),
+      trace: structuredClone(trace)
+    });
   }
 
-  return {
+  const result = {
     status: 'max_steps_exceeded',
     message: `Agent exceeded maxSteps=${maxSteps}`,
     steps: maxSteps,
     trace
   };
+  await checkpoint?.({
+    status: result.status,
+    task: userTask,
+    step: maxSteps,
+    message: result.message,
+    messages: structuredClone(messages),
+    trace: structuredClone(trace)
+  });
+  return result;
 }
 
 function toOpenAIMessages(messages) {

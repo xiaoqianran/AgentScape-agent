@@ -89,6 +89,29 @@ test('agent records tool failures as structured observations', async () => {
   assert.equal(result.trace[0].code, 'provider_unavailable');
 });
 
+test('agent refuses binary tool observations instead of checkpointing payload bytes', async () => {
+  let step = 0;
+  const checkpoints = [];
+  const result = await runAgent({
+    task: 'return an asset',
+    tools: {
+      source_3d_asset: sourceTool(async () => ({ artifact: Buffer.from('large-binary-payload') }))
+    },
+    checkpoint: async (snapshot) => checkpoints.push(snapshot),
+    gateway: async ({ messages }) => {
+      step += 1;
+      if (step === 1) return { message: '', toolCalls: [{ id: 'x', name: 'source_3d_asset', args: { prompt: 'apple' } }] };
+      const observation = JSON.parse(messages.at(-1).content);
+      assert.equal(observation.success, false);
+      assert.equal(observation.error.code, 'tool_result_not_serializable');
+      return { message: 'tool result rejected', toolCalls: [] };
+    }
+  });
+  assert.equal(result.status, 'completed');
+  const serialized = JSON.stringify(checkpoints);
+  assert.equal(serialized.includes('large-binary-payload'), false);
+});
+
 test('tool definitions do not leak execute functions into the model schema', () => {
   const definitions = toolDefinitions({ source_3d_asset: sourceTool(async () => {}) });
   assert.equal(definitions.length, 1);
