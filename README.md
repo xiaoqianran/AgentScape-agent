@@ -167,3 +167,26 @@ elapsed            220643 ms
 ```
 
 Adapter 对 Artifact/conditioning 使用公共字段白名单，防止 Sidecar/Provider 私有 path/cache 在未来版本中意外泄漏到 Agent。
+
+## Capability Preflight
+
+2D/3D Adapter 在第一次提交 Job 前会读取 Sidecar 的公开 `/v1/models`，并在 Adapter 生命周期内缓存结果：
+
+```text
+local request validation
+        ↓
+GET /v1/models
+        ↓
+model / profile available?
+   ├─ no  → capability_unavailable
+   └─ yes → submit durable Job
+```
+
+2026-08-28 已对真实 Sidecar 验证：
+
+```text
+modal-2D  sana-sprint-1.6b                  available
+modal-3D  fastsam3d-plus-plus/recommended   enabled
+```
+
+未知 model/profile 会在提交 Job 前 fail-closed；本地图片 digest 错误甚至不会触发 capability 网络请求。

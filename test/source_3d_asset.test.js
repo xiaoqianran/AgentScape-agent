@@ -153,6 +153,11 @@ test('modal-2D adapter submits deterministic jobs, polls, and verifies artifact 
   const sha256 = createHash('sha256').update(image).digest('hex');
   const fetchImpl = async (url, init = {}) => {
     requests.push({ url, init });
+    if (url.endsWith('/v1/models')) {
+      return new Response(JSON.stringify({
+        models: [{ id: 'sana-sprint-1.6b', profiles: [{ id: 'recommended' }] }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     if (url.endsWith('/v1/jobs') && init.method === 'POST') {
       const body = JSON.parse(init.body);
       return new Response(JSON.stringify({ id: body.job_id, status: 'running' }), {
@@ -193,7 +198,28 @@ test('modal-2D adapter submits deterministic jobs, polls, and verifies artifact 
   assert.equal(first[0].sha256, sha256);
   assert.equal(first[0].id, 'art-1');
   assert.equal(first[0].data.equals(image), true);
+  assert.equal(requests.filter(({ url }) => url.endsWith('/v1/models')).length, 1, 'capability preflight must be cached per adapter');
   assert.ok(requests.every(({ init }) => init.headers?.['X-Modal-2D-Session'] === 'session-secret-for-test'));
+});
+
+test('modal-2D capability preflight rejects unavailable model before job submit', async () => {
+  let jobRequests = 0;
+  const adapter = createModal2DAdapter({
+    endpoint: 'http://sidecar.test',
+    model: 'missing-model',
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/v1/models')) {
+        return new Response(JSON.stringify({ models: [{ id: 'sana-sprint-1.6b' }] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+      if (url.endsWith('/v1/jobs') && init.method === 'POST') jobRequests += 1;
+      throw new Error(`unexpected request: ${url}`);
+    }
+  });
+  await assert.rejects(() => adapter.preflight(), (error) => error.code === 'capability_unavailable');
+  assert.equal(jobRequests, 0);
 });
 
 test('OpenAI-compatible VLM adapter sends multimodal candidates and validates selected id', async () => {
@@ -250,7 +276,18 @@ test('modal-3D adapter submits source bytes with stable identity and verifies GL
   const glb = glbBytes(Buffer.from('mesh-payload'));
   const glbSha256 = createHash('sha256').update(glb).digest('hex');
   const submissions = [];
+  let capabilityRequests = 0;
   const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/v1/models')) {
+      capabilityRequests += 1;
+      return new Response(JSON.stringify({
+        models: [{
+          id: 'fastsam3d-plus-plus',
+          status: 'enabled',
+          profiles: [{ id: 'recommended' }]
+        }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     if (url.endsWith('/v1/jobs') && init.method === 'POST') {
       const form = init.body;
       const file = form.get('file');
@@ -316,6 +353,7 @@ test('modal-3D adapter submits source bytes with stable identity and verifies GL
   const first = await adapter.generate3D({ candidate });
   const second = await adapter.generate3D({ candidate });
   assert.equal(submissions.length, 2);
+  assert.equal(capabilityRequests, 1, 'capability preflight must be cached per adapter');
   assert.equal(submissions[0].jobId, submissions[1].jobId, 'same source request must reuse job identity');
   assert.equal(submissions[0].mediaType, 'image/png');
   assert.equal(submissions[0].bytes.equals(source), true, 'Sidecar source upload must preserve original bytes');
@@ -344,6 +382,11 @@ test('modal-3D adapter rejects corrupt GLB even when HTTP succeeds', async () =>
   const corrupt = Buffer.from('not-a-valid-glb');
   const corruptSha = createHash('sha256').update(corrupt).digest('hex');
   const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/v1/models')) {
+      return new Response(JSON.stringify({
+        models: [{ id: 'fastsam3d-plus-plus', status: 'enabled', profiles: [{ id: 'recommended' }] }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     if (url.endsWith('/v1/jobs') && init.method === 'POST') {
       return new Response(JSON.stringify({ status: 'running' }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
@@ -357,4 +400,38 @@ test('modal-3D adapter rejects corrupt GLB even when HTTP succeeds', async () =>
     () => adapter.generate3D({ candidate: { id: 'img', mediaType: 'image/png', sha256: sourceSha256, data: source } }),
     /not a complete GLB|invalid GLB magic/
   );
+});
+
+
+test('modal-3D capability preflight rejects unavailable model and profile before job submit', async () => {
+  const responses = {
+    models: [{ id: 'fastsam3d-plus-plus', status: 'enabled', profiles: [{ id: 'recommended' }] }]
+  };
+  let jobRequests = 0;
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/v1/models')) {
+      return new Response(JSON.stringify(responses), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }
+    if (url.endsWith('/v1/jobs') && init.method === 'POST') jobRequests += 1;
+    throw new Error(`unexpected request: ${url}`);
+  };
+
+  const missingModel = createModal3DAdapter({
+    endpoint: 'http://sidecar3d.test',
+    model: 'missing-model',
+    fetchImpl
+  });
+  await assert.rejects(() => missingModel.preflight(), (error) => error.code === 'capability_unavailable');
+
+  const missingProfile = createModal3DAdapter({
+    endpoint: 'http://sidecar3d.test',
+    model: 'fastsam3d-plus-plus',
+    profile: 'missing-profile',
+    fetchImpl
+  });
+  await assert.rejects(() => missingProfile.preflight(), (error) => error.code === 'capability_unavailable');
+  assert.equal(jobRequests, 0);
 });

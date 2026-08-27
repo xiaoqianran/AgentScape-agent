@@ -223,6 +223,52 @@ async function jsonRequest(fetchImpl, url, init) {
   return payload;
 }
 
+function profileIds(model) {
+  if (!Array.isArray(model?.profiles)) return [];
+  return model.profiles
+    .map((profile) => typeof profile === 'string' ? profile : profile?.id)
+    .filter((id) => typeof id === 'string' && id);
+}
+
+function createCapabilityPreflight({ base, headers, model, profile, providerName, fetchImpl }) {
+  let cached;
+  return async function preflight() {
+    if (!cached) {
+      cached = (async () => {
+        const payload = await jsonRequest(fetchImpl, `${base}/v1/models`, { headers });
+        if (!Array.isArray(payload.models)) throw new Error(`${providerName} model capability response is invalid`);
+        const selected = payload.models.find((candidate) => candidate?.id === model);
+        if (!selected) {
+          const error = new Error(`${providerName} model is unavailable: ${model}`);
+          error.code = 'capability_unavailable';
+          throw error;
+        }
+        if (selected.status && selected.status !== 'enabled') {
+          const error = new Error(`${providerName} model is not enabled: ${model}`);
+          error.code = 'capability_unavailable';
+          throw error;
+        }
+        const profiles = profileIds(selected);
+        if (profile && !profiles.includes(profile)) {
+          const error = new Error(`${providerName} profile is unavailable: ${model}/${profile}`);
+          error.code = 'capability_unavailable';
+          throw error;
+        }
+        return {
+          model,
+          profile: profile ?? null,
+          status: selected.status ?? 'available',
+          profiles
+        };
+      })().catch((error) => {
+        cached = undefined;
+        throw error;
+      });
+    }
+    return cached;
+  };
+}
+
 export function createModal2DAdapter({
   endpoint = 'http://127.0.0.1:3212',
   token,
@@ -233,6 +279,13 @@ export function createModal2DAdapter({
   fetchImpl = fetch
 } = {}) {
   const base = String(endpoint).replace(/\/$/, '');
+  const preflight = createCapabilityPreflight({
+    base,
+    headers: requestHeaders(token),
+    model,
+    providerName: 'modal-2D',
+    fetchImpl
+  });
 
   async function wait(jobId) {
     const deadline = Date.now() + timeoutMs;
@@ -255,6 +308,7 @@ export function createModal2DAdapter({
   }
 
   async function generateOne(prompt, seed) {
+    await preflight();
     const identity = createHash('sha256').update(`${model}\0${seed}\0${prompt}`).digest('hex').slice(0, 24);
     const jobId = `agent2d_${identity}`;
     await jsonRequest(fetchImpl, `${base}/v1/jobs`, {
@@ -284,6 +338,7 @@ export function createModal2DAdapter({
   }
 
   return {
+    preflight,
     async generateImages({ prompt, count = 4 }) {
       const normalized = requireText(prompt, 'prompt');
       return Promise.all(Array.from({ length: count }, (_, index) => generateOne(normalized, baseSeed + index * 31)));
@@ -409,6 +464,14 @@ export function createModal3DAdapter({
   fetchImpl = fetch
 } = {}) {
   const base = String(endpoint).replace(/\/$/, '');
+  const preflight = createCapabilityPreflight({
+    base,
+    headers: modal3DHeaders(token),
+    model,
+    profile,
+    providerName: 'modal-3D',
+    fetchImpl
+  });
 
   async function wait(jobId) {
     const deadline = Date.now() + timeoutMs;
@@ -432,6 +495,7 @@ export function createModal3DAdapter({
   }
 
   return {
+    preflight,
     async generate3D({ candidate }) {
       if (!candidate || typeof candidate !== 'object') throw new TypeError('candidate is required');
       if (!Buffer.isBuffer(candidate.data)) throw new TypeError('candidate.data must be a Buffer');
@@ -440,6 +504,7 @@ export function createModal3DAdapter({
       if (!extension) throw new TypeError(`unsupported 3D source media type: ${mediaType}`);
       const sourceSha256 = createHash('sha256').update(candidate.data).digest('hex');
       if (candidate.sha256 && candidate.sha256 !== sourceSha256) throw new Error(`candidate digest mismatch: ${candidate.id ?? 'unknown'}`);
+      await preflight();
       const identity = createHash('sha256')
         .update(`${model}\0${profile}\0${seed}\0${sourceSha256}`)
         .digest('hex')
