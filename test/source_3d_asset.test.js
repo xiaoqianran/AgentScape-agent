@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   createModal2DAdapter,
+  createModal3DAdapter,
   createOpenAICompatibleVisionRanker,
   decideSource3DAsset,
   initialSource3DAssetState,
@@ -230,5 +231,130 @@ test('OpenAI-compatible VLM adapter fails closed on invented candidate ids', asy
   await assert.rejects(
     () => ranker.evaluateImages({ prompt: 'red apple', candidates: [candidate('real')] }),
     /selected unknown candidate/
+  );
+});
+
+
+function glbBytes(payload = Buffer.alloc(16)) {
+  const total = 12 + payload.length;
+  const header = Buffer.alloc(12);
+  header.write('glTF', 0, 'ascii');
+  header.writeUInt32LE(2, 4);
+  header.writeUInt32LE(total, 8);
+  return Buffer.concat([header, payload]);
+}
+
+test('modal-3D adapter submits source bytes with stable identity and verifies GLB', async () => {
+  const source = Buffer.from('candidate-image-bytes');
+  const sourceSha256 = createHash('sha256').update(source).digest('hex');
+  const glb = glbBytes(Buffer.from('mesh-payload'));
+  const glbSha256 = createHash('sha256').update(glb).digest('hex');
+  const submissions = [];
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/v1/jobs') && init.method === 'POST') {
+      const form = init.body;
+      const file = form.get('file');
+      submissions.push({
+        model: form.get('model'),
+        profile: form.get('profile'),
+        seed: form.get('seed'),
+        jobId: form.get('job_id'),
+        mediaType: file.type,
+        bytes: Buffer.from(await file.arrayBuffer())
+      });
+      return new Response(JSON.stringify({ id: form.get('job_id'), status: 'running' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }
+    if (/\/v1\/jobs\/agent3d_/.test(url) && !url.endsWith('/artifact')) {
+      return new Response(JSON.stringify({
+        status: 'succeeded',
+        result: {
+          artifact: {
+            id: 'art-provider',
+            role: 'primary-glb',
+            mediaType: 'model/gltf-binary',
+            bytes: glb.length,
+            sha256: glbSha256,
+            path: 'private/provider/path.glb',
+            cache: { path: '/tmp/private-cache.glb' }
+          },
+          conditioning: {
+            strategy: 'birefnet',
+            engine: 'birefnet-general-lite',
+            source_sha256: sourceSha256,
+            canonical_sha256: 'c'.repeat(64),
+            foreground_ratio: 0.28,
+            path: 'conditioned-inputs/private.png'
+          }
+        }
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.endsWith('/artifact')) {
+      return new Response(glb, {
+        status: 200,
+        headers: {
+          'content-type': 'model/gltf-binary',
+          'x-artifact-id': 'art-provider',
+          'x-artifact-sha256': glbSha256
+        }
+      });
+    }
+    throw new Error(`unexpected request: ${url}`);
+  };
+  const adapter = createModal3DAdapter({
+    endpoint: 'http://sidecar3d.test',
+    token: 'local-3d-session',
+    model: 'fastsam3d-plus-plus',
+    profile: 'recommended',
+    seed: 42,
+    pollIntervalMs: 0,
+    fetchImpl
+  });
+  const candidate = { id: 'img-1', mediaType: 'image/png', sha256: sourceSha256, data: source };
+  const first = await adapter.generate3D({ candidate });
+  const second = await adapter.generate3D({ candidate });
+  assert.equal(submissions.length, 2);
+  assert.equal(submissions[0].jobId, submissions[1].jobId, 'same source request must reuse job identity');
+  assert.equal(submissions[0].mediaType, 'image/png');
+  assert.equal(submissions[0].bytes.equals(source), true, 'Sidecar source upload must preserve original bytes');
+  assert.equal(first.id, 'art-provider');
+  assert.equal(first.sha256, glbSha256);
+  assert.equal(first.bytes, glb.length);
+  assert.equal(first.data.equals(glb), true);
+  assert.equal(first.conditioning.strategy, 'birefnet');
+  assert.equal(first.conditioning.source_sha256, sourceSha256);
+  assert.equal('path' in first, false, 'Provider-private artifact path must not escape the adapter');
+  assert.equal('cache' in first, false, 'Sidecar-private cache metadata must not escape the adapter');
+  assert.equal('path' in first.conditioning, false, 'Provider-private conditioning path must not escape the adapter');
+});
+
+test('modal-3D adapter fails closed on candidate digest mismatch', async () => {
+  const adapter = createModal3DAdapter({ endpoint: 'http://sidecar3d.test', fetchImpl: async () => { throw new Error('must not call'); } });
+  await assert.rejects(
+    () => adapter.generate3D({ candidate: { id: 'img', mediaType: 'image/png', sha256: '0'.repeat(64), data: Buffer.from('different') } }),
+    /candidate digest mismatch/
+  );
+});
+
+test('modal-3D adapter rejects corrupt GLB even when HTTP succeeds', async () => {
+  const source = Buffer.from('image');
+  const sourceSha256 = createHash('sha256').update(source).digest('hex');
+  const corrupt = Buffer.from('not-a-valid-glb');
+  const corruptSha = createHash('sha256').update(corrupt).digest('hex');
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/v1/jobs') && init.method === 'POST') {
+      return new Response(JSON.stringify({ status: 'running' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (!url.endsWith('/artifact')) {
+      return new Response(JSON.stringify({ status: 'succeeded', result: { artifact: {} } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(corrupt, { status: 200, headers: { 'x-artifact-sha256': corruptSha } });
+  };
+  const adapter = createModal3DAdapter({ endpoint: 'http://sidecar3d.test', pollIntervalMs: 0, fetchImpl });
+  await assert.rejects(
+    () => adapter.generate3D({ candidate: { id: 'img', mediaType: 'image/png', sha256: sourceSha256, data: source } }),
+    /not a complete GLB|invalid GLB magic/
   );
 });

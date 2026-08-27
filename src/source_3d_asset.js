@@ -369,3 +369,117 @@ export function createSource3DAssetTool(deps) {
     }
   };
 }
+
+function modal3DHeaders(token, extra = {}) {
+  return token ? { ...extra, 'X-Modal-3D-Session': token } : extra;
+}
+
+const PUBLIC_3D_ARTIFACT_FIELDS = new Set([
+  'id', 'role', 'mediaType', 'digest', 'mime', 'sha256', 'bytes', 'glb_version'
+]);
+const PUBLIC_CONDITIONING_FIELDS = new Set([
+  'strategy', 'engine', 'source_sha256', 'canonical_sha256', 'source_format',
+  'source_size', 'foreground_bbox', 'foreground_ratio', 'canonical_size',
+  'bytes', 'mask_elapsed_ms'
+]);
+
+function pickPublicFields(value, allowed) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([key]) => allowed.has(key)));
+}
+
+function verifyGlb(data) {
+  if (!Buffer.isBuffer(data) || data.length < 12) throw new Error('modal-3D artifact is not a complete GLB');
+  if (data.subarray(0, 4).toString('ascii') !== 'glTF') throw new Error('modal-3D artifact has invalid GLB magic');
+  const version = data.readUInt32LE(4);
+  const declaredBytes = data.readUInt32LE(8);
+  if (version !== 2) throw new Error(`modal-3D artifact has unsupported GLB version: ${version}`);
+  if (declaredBytes !== data.length) throw new Error(`modal-3D artifact byte length mismatch: declared=${declaredBytes} actual=${data.length}`);
+  return { version, declaredBytes };
+}
+
+export function createModal3DAdapter({
+  endpoint = 'http://127.0.0.1:3213',
+  token,
+  model = 'fastsam3d-plus-plus',
+  profile = 'recommended',
+  seed = 42,
+  pollIntervalMs = 1000,
+  timeoutMs = 40 * 60 * 1000,
+  fetchImpl = fetch
+} = {}) {
+  const base = String(endpoint).replace(/\/$/, '');
+
+  async function wait(jobId) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const state = await jsonRequest(fetchImpl, `${base}/v1/jobs/${encodeURIComponent(jobId)}`, {
+        headers: modal3DHeaders(token)
+      });
+      if (state.status === 'succeeded') return state;
+      if (['failed', 'cancelled', 'expired'].includes(state.status)) {
+        const error = new Error(`modal-3D job ${jobId} ended as ${state.status}`);
+        error.code = state.error_code ?? `three_d_${state.status}`;
+        error.retryable = Boolean(state.retryable);
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+    const error = new Error(`modal-3D job ${jobId} timed out`);
+    error.code = 'three_d_timeout';
+    error.retryable = true;
+    throw error;
+  }
+
+  return {
+    async generate3D({ candidate }) {
+      if (!candidate || typeof candidate !== 'object') throw new TypeError('candidate is required');
+      if (!Buffer.isBuffer(candidate.data)) throw new TypeError('candidate.data must be a Buffer');
+      const mediaType = candidate.mediaType ?? 'image/png';
+      const extension = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[mediaType];
+      if (!extension) throw new TypeError(`unsupported 3D source media type: ${mediaType}`);
+      const sourceSha256 = createHash('sha256').update(candidate.data).digest('hex');
+      if (candidate.sha256 && candidate.sha256 !== sourceSha256) throw new Error(`candidate digest mismatch: ${candidate.id ?? 'unknown'}`);
+      const identity = createHash('sha256')
+        .update(`${model}\0${profile}\0${seed}\0${sourceSha256}`)
+        .digest('hex')
+        .slice(0, 24);
+      const jobId = `agent3d_${identity}`;
+      const form = new FormData();
+      form.append('file', new Blob([candidate.data], { type: mediaType }), `source.${extension}`);
+      form.append('model', model);
+      form.append('profile', profile);
+      form.append('seed', String(seed));
+      form.append('job_id', jobId);
+
+      await jsonRequest(fetchImpl, `${base}/v1/jobs`, {
+        method: 'POST',
+        headers: modal3DHeaders(token),
+        body: form
+      });
+      const state = await wait(jobId);
+      const response = await fetchImpl(`${base}/v1/jobs/${encodeURIComponent(jobId)}/artifact`, {
+        headers: modal3DHeaders(token)
+      });
+      if (!response.ok) throw new Error(`modal-3D artifact ${jobId} failed with HTTP ${response.status}`);
+      const data = Buffer.from(await response.arrayBuffer());
+      const sha256 = createHash('sha256').update(data).digest('hex');
+      const expected = response.headers.get('x-artifact-sha256');
+      if (expected && expected !== sha256) throw new Error(`modal-3D artifact digest mismatch for ${jobId}`);
+      verifyGlb(data);
+      const providerArtifact = pickPublicFields(state.result?.artifact, PUBLIC_3D_ARTIFACT_FIELDS);
+      const conditioning = pickPublicFields(state.result?.conditioning, PUBLIC_CONDITIONING_FIELDS);
+      return {
+        ...providerArtifact,
+        id: response.headers.get('x-artifact-id') ?? providerArtifact.id ?? jobId,
+        jobId,
+        mediaType: 'model/gltf-binary',
+        bytes: data.length,
+        sha256,
+        model,
+        conditioning: Object.keys(conditioning).length ? conditioning : null,
+        data
+      };
+    }
+  };
+}

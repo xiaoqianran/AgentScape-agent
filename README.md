@@ -134,3 +134,36 @@ Agent trajectory replay   5 cases
 Workflow replay           5 cases
 Unit / contract tests     20 tests
 ```
+
+## Verified modal-3D Sidecar Adapter
+
+2026-08-28 已用真实 `modal-3D-client` 与 `modal-3D` 执行：
+
+```text
+real modal-2D candidate PNG
+        ↓
+AgentScape-agent
+        ↓
+modal-3D-client
+        ↓
+Provider InputConditioner / BiRefNet
+        ↓
+FastSAM3D++
+        ↓
+verified GLB
+```
+
+结果：
+
+```text
+jobId              agent3d_193038dd45916f91ea1b4437
+artifactId         art_adf3b2520c19532daad5197a984e2
+artifact bytes     7,525,252
+GLB SHA-256        543694494b4482d053d1eaae47e84cdb08f9170287ad319f6be66d40fa0fb667
+conditioning       birefnet / birefnet-general-lite
+foreground ratio   0.2843132019042969
+source SHA-256     MATCH
+elapsed            220643 ms
+```
+
+Adapter 对 Artifact/conditioning 使用公共字段白名单，防止 Sidecar/Provider 私有 path/cache 在未来版本中意外泄漏到 Agent。
