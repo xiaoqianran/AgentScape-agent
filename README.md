@@ -114,3 +114,23 @@ run_<id>.json
 ```
 
 如果 checkpoint 写入失败，Agent 立即停止，避免“模型继续执行但 durable evidence 已丢失”。真正的 resume 要等所有 Tool 都具有稳定 request identity / idempotency 后再开启。
+
+## Agent Trajectory Gate
+
+`agent-trajectory-replay-v1` 独立验证 LLM Agent 层，而不是重复测试 `source_3d_asset` 内部状态机：
+
+```text
+source_3d_asset 正常调用      PASS
+未知 Tool hallucination       PASS → tool_not_found
+Provider failure observation  PASS
+binary result rejection       PASS
+runaway tool loop             PASS → maxSteps
+```
+
+当前 CI 因此同时守两层：
+
+```text
+Agent trajectory replay   5 cases
+Workflow replay           5 cases
+Unit / contract tests     20 tests
+```

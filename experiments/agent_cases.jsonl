@@ -1,0 +1,5 @@
+{"id":"source-asset-happy","scenario":"source_asset","expected":{"status":"completed","toolNames":["source_3d_asset"],"maxToolCalls":1,"maxSteps":2}}
+{"id":"unknown-tool-hallucination","scenario":"unknown_tool","expected":{"status":"completed","toolNames":["shell_exec"],"errorCodes":["tool_not_found"],"maxToolCalls":1,"maxSteps":2}}
+{"id":"provider-failure-observed","scenario":"tool_failure","expected":{"status":"completed","toolNames":["source_3d_asset"],"errorCodes":["provider_unavailable"],"maxToolCalls":1,"maxSteps":2}}
+{"id":"binary-result-rejected","scenario":"binary_result","expected":{"status":"completed","toolNames":["source_3d_asset"],"errorCodes":["tool_result_not_serializable"],"maxToolCalls":1,"maxSteps":2}}
+{"id":"runaway-agent-budget","scenario":"runaway","expected":{"status":"max_steps_exceeded","toolNames":["source_3d_asset","source_3d_asset","source_3d_asset"],"maxToolCalls":3,"maxSteps":3}}
