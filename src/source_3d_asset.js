@@ -426,19 +426,6 @@ export function createModal2DAdapter({
     fetchImpl
   });
 
-  let submitTail = Promise.resolve();
-  async function serializedSubmit(task) {
-    const previous = submitTail;
-    let release;
-    submitTail = new Promise((resolve) => { release = resolve; });
-    await previous;
-    try {
-      return await task();
-    } finally {
-      release();
-    }
-  }
-
   async function wait(jobId, signal) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -472,44 +459,62 @@ export function createModal2DAdapter({
     throw error;
   }
 
-  async function generateOne(prompt, seed, runScope, signal) {
+  async function fetchBatchArtifact(jobId, index, seed, sharedTiming, providerItem, signal) {
+    const artifactStarted = performance.now();
+    const response = await fetchImpl(
+      `${base}/v1/jobs/${encodeURIComponent(jobId)}/artifacts/${index}`,
+      { headers: requestHeaders(token), signal }
+    );
+    if (!response.ok) throw new Error(`modal-2D batch artifact ${jobId}/${index} failed with HTTP ${response.status}`);
+    const data = Buffer.from(await response.arrayBuffer());
+    const artifactFetchMs = elapsedMs(artifactStarted);
+    const sha256 = createHash('sha256').update(data).digest('hex');
+    const expected = response.headers.get('x-artifact-sha256');
+    if (expected && expected !== sha256) throw new Error(`modal-2D artifact digest mismatch for ${jobId}/${index}`);
+    return {
+      id: response.headers.get('x-artifact-id') ?? `${jobId}_${index}`,
+      jobId,
+      mediaType: response.headers.get('content-type')?.split(';')[0] ?? 'image/png',
+      bytes: data.length,
+      sha256,
+      timing: {
+        ...sharedTiming,
+        artifactFetchMs,
+        providerBatch: sharedTiming.providerBatch ?? null,
+        providerItem: providerItem ?? null
+      },
+      model,
+      seed,
+      data
+    };
+  }
+
+  async function generateBatch(prompt, seeds, runScope, signal) {
     const totalStarted = performance.now();
     throwIfCancelled(signal);
     const preflightStarted = performance.now();
     await preflight(signal);
     const preflightMs = elapsedMs(preflightStarted);
-    throwIfCancelled(signal);
     const identity = createHash('sha256')
-      .update(`${runScope}\0${model}\0${seed}\0${prompt}`)
+      .update(`${runScope}\0${model}\0${seeds.join(',')}\0${prompt}`)
       .digest('hex')
       .slice(0, 24);
     const jobId = `agent2d_${identity}`;
     const lookupStarted = performance.now();
     let state = await existingJob(fetchImpl, `${base}/v1/jobs/${encodeURIComponent(jobId)}`, {
-      headers: requestHeaders(token),
-      signal
+      headers: requestHeaders(token), signal
     });
     const lookupMs = elapsedMs(lookupStarted);
     let submitMs = 0;
-    let reusedJob = Boolean(state);
+    const reusedJob = Boolean(state);
     if (!state) {
       const submitStarted = performance.now();
       try {
-        state = await serializedSubmit(async () => {
-          const rebound = await existingJob(fetchImpl, `${base}/v1/jobs/${encodeURIComponent(jobId)}`, {
-            headers: requestHeaders(token),
-            signal
-          });
-          if (rebound) {
-            reusedJob = true;
-            return rebound;
-          }
-          return jsonRequest(fetchImpl, `${base}/v1/jobs`, {
-            method: 'POST',
-            headers: requestHeaders(token, { 'content-type': 'application/json' }),
-            body: JSON.stringify({ prompt, model, seed, job_id: jobId }),
-            signal
-          });
+        state = await jsonRequest(fetchImpl, `${base}/v1/jobs`, {
+          method: 'POST',
+          headers: requestHeaders(token, { 'content-type': 'application/json' }),
+          body: JSON.stringify({ prompt, model, seeds, job_id: jobId }),
+          signal
         });
       } catch (error) {
         if (signal?.aborted || error?.name === 'AbortError') await cancelAfterAbort(fetchImpl, base, jobId, requestHeaders(token), signal);
@@ -518,39 +523,34 @@ export function createModal2DAdapter({
       submitMs = elapsedMs(submitStarted);
     }
     const waitStarted = performance.now();
-    await wait(jobId, signal);
+    state = await wait(jobId, signal);
     const waitMs = elapsedMs(waitStarted);
     throwIfCancelled(signal);
-    const artifactStarted = performance.now();
-    const response = await fetchImpl(`${base}/v1/jobs/${encodeURIComponent(jobId)}/artifact`, {
-      headers: requestHeaders(token),
-      signal
-    });
-    if (!response.ok) throw new Error(`modal-2D artifact ${jobId} failed with HTTP ${response.status}`);
-    const data = Buffer.from(await response.arrayBuffer());
-    const artifactFetchMs = elapsedMs(artifactStarted);
-    const sha256 = createHash('sha256').update(data).digest('hex');
-    const expected = response.headers.get('x-artifact-sha256');
-    if (expected && expected !== sha256) throw new Error(`modal-2D artifact digest mismatch for ${jobId}`);
-    return {
-      id: response.headers.get('x-artifact-id') ?? jobId,
-      jobId,
-      mediaType: response.headers.get('content-type')?.split(';')[0] ?? 'image/png',
-      bytes: data.length,
-      sha256,
-      timing: {
-        preflightMs,
-        lookupMs,
-        submitMs,
-        waitMs,
-        artifactFetchMs,
-        totalMs: elapsedMs(totalStarted),
-        reusedJob
-      },
-      model,
-      seed,
-      data
+    const result = state?.result;
+    const descriptors = Array.isArray(result?.artifacts) ? result.artifacts : [];
+    if (descriptors.length !== seeds.length) {
+      throw new Error(`modal-2D batch returned ${descriptors.length} artifacts for ${seeds.length} seeds`);
+    }
+    const providerTiming = result?.timing && typeof result.timing === 'object' ? result.timing : null;
+    const providerItems = Array.isArray(providerTiming?.items) ? providerTiming.items : [];
+    const sharedTiming = {
+      preflightMs,
+      lookupMs,
+      submitMs,
+      waitMs,
+      totalMs: elapsedMs(totalStarted),
+      reusedJob,
+      providerBatch: providerTiming
+        ? {
+            workerReused: providerTiming.worker_reused ?? null,
+            workerLoadMs: providerTiming.worker_load_ms ?? null,
+            batchTotalMs: providerTiming.batch_total_ms ?? null
+          }
+        : null
     };
+    return Promise.all(seeds.map((seed, index) =>
+      fetchBatchArtifact(jobId, index, seed, sharedTiming, providerItems[index] ?? null, signal)
+    ));
   }
 
   return {
@@ -559,10 +559,8 @@ export function createModal2DAdapter({
       const normalized = requireText(prompt, 'prompt');
       throwIfCancelled(signal);
       const runScope = executionId ?? randomUUID();
-      return Promise.all(Array.from(
-        { length: count },
-        (_, index) => generateOne(normalized, baseSeed + index * 31, runScope, signal)
-      ));
+      const seeds = Array.from({ length: count }, (_, index) => baseSeed + index * 31);
+      return generateBatch(normalized, seeds, runScope, signal);
     }
   };
 }

@@ -167,10 +167,11 @@ test('imperative shell turns effect errors into explicit failed state', async ()
   });
 });
 
-test('modal-2D adapter scopes job ids per generation run, polls, and verifies artifact digest', async () => {
+test('modal-2D adapter uses one batch job and rebinds it on resume', async () => {
   const requests = [];
-  const image = Buffer.from('real-ish-png-bytes');
-  const sha256 = createHash('sha256').update(image).digest('hex');
+  const images = [Buffer.from('image-42'), Buffer.from('image-73')];
+  const digests = images.map((image) => createHash('sha256').update(image).digest('hex'));
+  const knownJobs = new Set();
   const fetchImpl = async (url, init = {}) => {
     requests.push({ url, init });
     if (url.endsWith('/v1/models')) {
@@ -180,24 +181,45 @@ test('modal-2D adapter scopes job ids per generation run, polls, and verifies ar
     }
     if (url.endsWith('/v1/jobs') && init.method === 'POST') {
       const body = JSON.parse(init.body);
+      assert.deepEqual(body.seeds, [42, 73]);
+      knownJobs.add(body.job_id);
       return new Response(JSON.stringify({ id: body.job_id, status: 'running' }), {
         status: 200,
         headers: { 'content-type': 'application/json' }
       });
     }
-    if (/\/v1\/jobs\/agent2d_/.test(url) && !url.endsWith('/artifact')) {
-      return new Response(JSON.stringify({ status: 'succeeded' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' }
-      });
+    const match = url.match(/\/v1\/jobs\/(agent2d_[^/]+)/);
+    if (match && !url.includes('/artifacts/')) {
+      if (!knownJobs.has(match[1])) {
+        return new Response('{}', { status: 404, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({
+        status: 'succeeded',
+        result: {
+          artifacts: [
+            { id: 'art-42', sha256: digests[0] },
+            { id: 'art-73', sha256: digests[1] }
+          ],
+          timing: {
+            worker_load_ms: 5000,
+            batch_total_ms: 1800,
+            items: [
+              { seed: 42, inference_ms: 400, total_ms: 450 },
+              { seed: 73, inference_ms: 420, total_ms: 470 }
+            ]
+          }
+        }
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
-    if (url.endsWith('/artifact')) {
-      return new Response(image, {
+    const artifact = url.match(/\/artifacts\/(\d+)$/);
+    if (artifact) {
+      const index = Number(artifact[1]);
+      return new Response(images[index], {
         status: 200,
         headers: {
           'content-type': 'image/png',
-          'x-artifact-id': 'art-1',
-          'x-artifact-sha256': sha256
+          'x-artifact-id': `art-${index === 0 ? 42 : 73}`,
+          'x-artifact-sha256': digests[index]
         }
       });
     }
@@ -211,14 +233,21 @@ test('modal-2D adapter scopes job ids per generation run, polls, and verifies ar
     pollIntervalMs: 0,
     fetchImpl
   });
-  const first = await adapter.generateImages({ prompt: 'red apple', count: 1 });
-  const second = await adapter.generateImages({ prompt: 'red apple', count: 1 });
+  const executionId = 'run__1__0__source';
+  const first = await adapter.generateImages({ prompt: 'red apple', count: 2, executionId });
+  const resumed = await adapter.generateImages({ prompt: 'red apple', count: 2, executionId });
 
-  assert.notEqual(first[0].jobId, second[0].jobId, 'separate runs must not reuse a sidecar job id');
-  assert.equal(first[0].sha256, sha256);
-  assert.equal(first[0].id, 'art-1');
-  assert.equal(first[0].data.equals(image), true);
-  assert.equal(requests.filter(({ url }) => url.endsWith('/v1/models')).length, 1, 'capability preflight must be cached per adapter');
+  assert.equal(first.length, 2);
+  assert.equal(first[0].jobId, first[1].jobId, 'all candidates must share one batch job');
+  assert.equal(resumed[0].jobId, first[0].jobId);
+  assert.equal(requests.filter(({ url, init }) => url.endsWith('/v1/jobs') && init.method === 'POST').length, 1);
+  assert.equal(first[0].timing.providerBatch.workerLoadMs, 5000);
+  assert.equal(first[0].timing.providerBatch.batchTotalMs, 1800);
+  assert.equal(first[0].timing.providerItem.inference_ms, 400);
+  assert.equal(resumed[0].timing.reusedJob, true);
+  assert.equal(first[0].data.equals(images[0]), true);
+  assert.equal(first[1].data.equals(images[1]), true);
+  assert.equal(requests.filter(({ url }) => url.endsWith('/v1/models')).length, 1);
   assert.ok(requests.every(({ init }) => init.headers?.['X-Modal-2D-Session'] === 'session-secret-for-test'));
 });
 
@@ -245,6 +274,7 @@ test('modal-2D capability preflight rejects unavailable model before job submit'
 test('modal-2D adapter cancels a running Sidecar job on AbortSignal', async () => {
   const controller = new AbortController();
   const deletes = [];
+  let submitted = false;
   const adapter = createModal2DAdapter({
     endpoint: 'http://sidecar.test',
     pollIntervalMs: 0,
@@ -253,6 +283,7 @@ test('modal-2D adapter cancels a running Sidecar job on AbortSignal', async () =
         return new Response(JSON.stringify({ models: [{ id: 'sana-sprint-1.6b' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
       }
       if (url.endsWith('/v1/jobs') && init.method === 'POST') {
+        submitted = true;
         return new Response(JSON.stringify({ status: 'running' }), { status: 200, headers: { 'content-type': 'application/json' } });
       }
       if (init.method === 'DELETE') {
@@ -260,6 +291,7 @@ test('modal-2D adapter cancels a running Sidecar job on AbortSignal', async () =
         return new Response(JSON.stringify({ status: 'cancel_requested' }), { status: 200, headers: { 'content-type': 'application/json' } });
       }
       if (/\/v1\/jobs\/agent2d_/.test(url)) {
+        if (!submitted) return new Response('{}', { status: 404, headers: { 'content-type': 'application/json' } });
         controller.abort(new Error('user cancelled images'));
         return new Response(JSON.stringify({ status: 'running' }), { status: 200, headers: { 'content-type': 'application/json' } });
       }

@@ -381,25 +381,8 @@ same executionId
         └─ 3D Sidecar existing-job lookup / rebind
 ```
 
-同日完成真实生产链 timing 基准：
+同日完成的首次真实生产链 timing 基准中，4 个 candidate 曾被映射成 4 个独立 GPU Job，2D slice 为 `54.199s`。该数字现在只作为 **pre-batch baseline**，不再代表当前实现。
 
-```text
-total one-shot                 510,344.586 ms   510.345 s
-4-image generation slice        54,198.521 ms    54.199 s
-VLM ranking                    277,882.501 ms   277.883 s
-3D generation                  177,445.324 ms   177.445 s
-Asset publish                      562.969 ms     0.563 s
-World build + runtime verify       253.733 ms     0.254 s
-```
-
-四个 2D candidate 的细分：
-
-| Seed | Preflight | Lookup | Submit | Wait | Artifact fetch | Total |
-|---:|---:|---:|---:|---:|---:|---:|
-| 42 | 6234.827 ms | 4.797 ms | 1844.657 ms | 39095.985 ms | 6.101 ms | 47186.995 ms |
-| 73 | 6220.083 ms | 4.702 ms | 5030.794 ms | 38239.003 ms | 5.472 ms | 49500.553 ms |
-| 104 | 6220.439 ms | 4.542 ms | 6338.546 ms | 41614.371 ms | 4.186 ms | 54182.536 ms |
-| 135 | 6220.795 ms | 4.350 ms | 7608.284 ms | 38780.914 ms | 4.230 ms | 52619.303 ms |
 
 3D 细分：
 
@@ -412,4 +395,44 @@ artifact fetch       24.632 ms
 total            177445.086 ms
 ```
 
-本轮 profiling 还暴露并修复了真实 2D submit 并发压力：候选 Job 的 `lookup + POST submit` 现在串行化握手，而远端 GPU `wait/poll` 仍保持并行，因此避免本地 Sidecar/Modal session submit 竞争，不牺牲四图生成并行度。
+
+
+## Verified 2D Candidate Batch
+
+2026-08-28，2D candidate generation 从“每张图一个远端 GPU Job”迁移为“一个 batch Job / 一个 warm SANA worker”：
+
+```text
+Text prompt
+  ↓
+seeds=[42,73,104,135]
+  ↓
+ONE modal-2D-client Job
+  ↓
+ONE modal-2D submit_batch FunctionCall
+  ↓
+ONE SanaSprintWorker / L40S
+  ├─ seed 42
+  ├─ seed 73
+  ├─ seed 104
+  └─ seed 135
+```
+
+最终连续 cold → warm 实测：
+
+```text
+pre-batch baseline             ~54.2 s
+cold batch                      43.362 s
+warm batch                       9.075 s
+warm provider batch compute      6.782 s
+```
+
+Warm worker 内单图 inference：
+
+| Seed | Inference |
+|---:|---:|
+| 42 | 1.352 s |
+| 73 | 1.353 s |
+| 104 | 1.240 s |
+| 135 | 2.428 s |
+
+Warm batch 只创建一个 `agent2d_*` Job，`providerBatch.workerReused=true` 且 `workerLoadMs=null`。Provider worker 保温窗口为 300s；generation hot path 不再同步执行 `prefetch.remote()`。同一个 `executionId` 恢复时会 rebind 同一个 batch Job，而不是重复创建 4 个 GPU Job。
