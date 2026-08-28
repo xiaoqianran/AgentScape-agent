@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-const TERMINAL_PHASES = new Set(['done', 'failed']);
+const TERMINAL_PHASES = new Set(['done', 'failed', 'cancelled']);
 const EFFECT = Object.freeze({
   GENERATE_IMAGES: 'generate_images',
   EVALUATE_IMAGES: 'evaluate_images',
@@ -48,7 +48,8 @@ export function initialSource3DAssetState({ prompt, candidateCount = 4 } = {}) {
     selectedId: null,
     artifact: null,
     asset: null,
-    error: null
+    error: null,
+    cancellation: null
   };
 }
 
@@ -108,6 +109,21 @@ export function decideSource3DAsset(state, event) {
             code: event.code ?? 'workflow_failed',
             message: requireText(event.message, 'failure message'),
             retryable: Boolean(event.retryable)
+          },
+          cancellation: null
+        },
+        effects: []
+      };
+
+    case 'cancelled':
+      return {
+        state: {
+          ...state,
+          phase: 'cancelled',
+          error: null,
+          cancellation: {
+            code: 'workflow_cancelled',
+            message: requireText(event.message ?? 'workflow cancelled', 'cancellation message')
           }
         },
         effects: []
@@ -118,12 +134,14 @@ export function decideSource3DAsset(state, event) {
   }
 }
 
-export async function runSource3DAsset(request, deps) {
+export async function runSource3DAsset(request, deps, { signal } = {}) {
   const required = ['generateImages', 'evaluateImages', 'generate3D', 'publishAsset'];
   for (const name of required) if (typeof deps?.[name] !== 'function') throw new TypeError(`deps.${name} is required`);
 
   let state = initialSource3DAssetState(request);
-  let event = { type: 'started' };
+  let event = signal?.aborted
+    ? { type: 'cancelled', message: cancellationMessage(signal) }
+    : { type: 'started' };
   const resources = new Map();
   const trace = [];
 
@@ -164,48 +182,89 @@ export async function runSource3DAsset(request, deps) {
     }
 
     try {
-      event = await executeEffect(transition.effects[0], state, resources, deps);
+      event = await executeEffect(transition.effects[0], state, resources, deps, signal);
     } catch (error) {
-      event = {
-        type: 'failed',
-        code: error?.code ?? 'effect_failed',
-        message: error instanceof Error ? error.message : String(error),
-        retryable: Boolean(error?.retryable)
-      };
+      event = signal?.aborted || error?.code === 'workflow_cancelled' || error?.name === 'AbortError'
+        ? { type: 'cancelled', message: error?.message ?? cancellationMessage(signal) }
+        : {
+            type: 'failed',
+            code: error?.code ?? 'effect_failed',
+            message: error instanceof Error ? error.message : String(error),
+            retryable: Boolean(error?.retryable)
+          };
     }
   }
 
   return { state, trace };
 }
 
-async function executeEffect(effect, state, resources, deps) {
+async function executeEffect(effect, state, resources, deps, signal) {
+  throwIfCancelled(signal);
   switch (effect.type) {
     case EFFECT.GENERATE_IMAGES: {
-      const candidates = await deps.generateImages({ prompt: effect.prompt, count: effect.count });
+      const candidates = await deps.generateImages({ prompt: effect.prompt, count: effect.count, signal });
       for (const candidate of candidates) resources.set(candidate.id, candidate);
       return { type: 'images_generated', candidates };
     }
     case EFFECT.EVALUATE_IMAGES: {
       const candidates = effect.candidateIds.map((id) => resources.get(id));
       if (candidates.some((candidate) => !candidate)) throw new Error('candidate payload is unavailable');
-      const decision = await deps.evaluateImages({ prompt: effect.prompt, candidates });
+      const decision = await deps.evaluateImages({ prompt: effect.prompt, candidates, signal });
       return { type: 'candidate_selected', selectedId: decision.selectedId, evaluation: decision };
     }
     case EFFECT.GENERATE_3D: {
       const candidate = resources.get(effect.candidateId);
       if (!candidate) throw new Error(`candidate payload is unavailable: ${effect.candidateId}`);
-      const artifact = await deps.generate3D({ prompt: effect.prompt, candidate });
+      const artifact = await deps.generate3D({ prompt: effect.prompt, candidate, signal });
       resources.set(artifact.id, artifact);
       return { type: 'three_d_generated', artifact };
     }
     case EFFECT.PUBLISH_ASSET: {
       const artifact = resources.get(effect.artifactId);
       if (!artifact) throw new Error(`artifact payload is unavailable: ${effect.artifactId}`);
-      return { type: 'asset_published', asset: await deps.publishAsset({ prompt: effect.prompt, artifact }) };
+      return { type: 'asset_published', asset: await deps.publishAsset({ prompt: effect.prompt, artifact, signal }) };
     }
     default:
       throw new Error(`unknown effect: ${effect.type}`);
   }
+}
+
+function cancellationMessage(signal) {
+  const reason = signal?.reason;
+  if (reason instanceof Error && reason.message) return reason.message;
+  if (typeof reason === 'string' && reason.trim()) return reason.trim();
+  return 'workflow cancelled';
+}
+
+function cancellationError(signal) {
+  const error = new Error(cancellationMessage(signal));
+  error.code = 'workflow_cancelled';
+  error.retryable = false;
+  return error;
+}
+
+function throwIfCancelled(signal) {
+  if (signal?.aborted) throw cancellationError(signal);
+}
+
+function delayOrCancel(ms, signal) {
+  if (!ms) {
+    throwIfCancelled(signal);
+    return Promise.resolve();
+  }
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  throwIfCancelled(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(cancellationError(signal));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function requestHeaders(token, extra = {}) {
@@ -223,6 +282,43 @@ async function jsonRequest(fetchImpl, url, init) {
   return payload;
 }
 
+async function cancelSidecarJob(fetchImpl, base, jobId, headers) {
+  let lastError;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      const response = await fetchImpl(`${base}/v1/jobs/${encodeURIComponent(jobId)}`, {
+        method: 'DELETE',
+        headers
+      });
+      if (response.status === 404 && attempt < 19) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(`cancel ${jobId} failed with HTTP ${response.status}: ${payload.detail ?? response.statusText}`);
+      return payload;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 19) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
+    }
+  }
+  throw lastError ?? new Error(`cancel ${jobId} failed`);
+}
+
+async function cancelAfterAbort(fetchImpl, base, jobId, headers, signal) {
+  try {
+    await cancelSidecarJob(fetchImpl, base, jobId, headers);
+  } catch (error) {
+    const cancelled = cancellationError(signal);
+    cancelled.cancelError = error instanceof Error ? error.message : String(error);
+    throw cancelled;
+  }
+  throw cancellationError(signal);
+}
+
 function profileIds(model) {
   if (!Array.isArray(model?.profiles)) return [];
   return model.profiles
@@ -232,10 +328,10 @@ function profileIds(model) {
 
 function createCapabilityPreflight({ base, headers, model, profile, providerName, fetchImpl }) {
   let cached;
-  return async function preflight() {
+  return async function preflight(signal) {
     if (!cached) {
       cached = (async () => {
-        const payload = await jsonRequest(fetchImpl, `${base}/v1/models`, { headers });
+        const payload = await jsonRequest(fetchImpl, `${base}/v1/models`, { headers, signal });
         if (!Array.isArray(payload.models)) throw new Error(`${providerName} model capability response is invalid`);
         const selected = payload.models.find((candidate) => candidate?.id === model);
         if (!selected) {
@@ -287,19 +383,32 @@ export function createModal2DAdapter({
     fetchImpl
   });
 
-  async function wait(jobId) {
+  async function wait(jobId, signal) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const state = await jsonRequest(fetchImpl, `${base}/v1/jobs/${encodeURIComponent(jobId)}`, {
-        headers: requestHeaders(token)
-      });
+      if (signal?.aborted) await cancelAfterAbort(fetchImpl, base, jobId, requestHeaders(token), signal);
+      let state;
+      try {
+        state = await jsonRequest(fetchImpl, `${base}/v1/jobs/${encodeURIComponent(jobId)}`, {
+          headers: requestHeaders(token),
+          signal
+        });
+      } catch (error) {
+        if (signal?.aborted || error?.name === 'AbortError') await cancelAfterAbort(fetchImpl, base, jobId, requestHeaders(token), signal);
+        throw error;
+      }
       if (state.status === 'succeeded') return state;
       if (['failed', 'cancelled', 'expired'].includes(state.status)) {
         const error = new Error(`modal-2D job ${jobId} ended as ${state.status}`);
         error.code = state.error_code ?? `image_${state.status}`;
         throw error;
       }
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      try {
+        await delayOrCancel(pollIntervalMs, signal);
+      } catch (error) {
+        if (error?.code === 'workflow_cancelled') await cancelAfterAbort(fetchImpl, base, jobId, requestHeaders(token), signal);
+        throw error;
+      }
     }
     const error = new Error(`modal-2D job ${jobId} timed out`);
     error.code = 'image_timeout';
@@ -307,18 +416,28 @@ export function createModal2DAdapter({
     throw error;
   }
 
-  async function generateOne(prompt, seed) {
-    await preflight();
+  async function generateOne(prompt, seed, signal) {
+    throwIfCancelled(signal);
+    await preflight(signal);
+    throwIfCancelled(signal);
     const identity = createHash('sha256').update(`${model}\0${seed}\0${prompt}`).digest('hex').slice(0, 24);
     const jobId = `agent2d_${identity}`;
-    await jsonRequest(fetchImpl, `${base}/v1/jobs`, {
-      method: 'POST',
-      headers: requestHeaders(token, { 'content-type': 'application/json' }),
-      body: JSON.stringify({ prompt, model, seed, job_id: jobId })
-    });
-    await wait(jobId);
+    try {
+      await jsonRequest(fetchImpl, `${base}/v1/jobs`, {
+        method: 'POST',
+        headers: requestHeaders(token, { 'content-type': 'application/json' }),
+        body: JSON.stringify({ prompt, model, seed, job_id: jobId }),
+        signal
+      });
+    } catch (error) {
+      if (signal?.aborted || error?.name === 'AbortError') await cancelAfterAbort(fetchImpl, base, jobId, requestHeaders(token), signal);
+      throw error;
+    }
+    await wait(jobId, signal);
+    throwIfCancelled(signal);
     const response = await fetchImpl(`${base}/v1/jobs/${encodeURIComponent(jobId)}/artifact`, {
-      headers: requestHeaders(token)
+      headers: requestHeaders(token),
+      signal
     });
     if (!response.ok) throw new Error(`modal-2D artifact ${jobId} failed with HTTP ${response.status}`);
     const data = Buffer.from(await response.arrayBuffer());
@@ -339,9 +458,10 @@ export function createModal2DAdapter({
 
   return {
     preflight,
-    async generateImages({ prompt, count = 4 }) {
+    async generateImages({ prompt, count = 4, signal }) {
       const normalized = requireText(prompt, 'prompt');
-      return Promise.all(Array.from({ length: count }, (_, index) => generateOne(normalized, baseSeed + index * 31)));
+      throwIfCancelled(signal);
+      return Promise.all(Array.from({ length: count }, (_, index) => generateOne(normalized, baseSeed + index * 31, signal)));
     }
   };
 }
@@ -358,7 +478,8 @@ export function createOpenAICompatibleVisionRanker({ baseUrl, apiKey, model, fet
   const modelName = requireText(model, 'model');
 
   return {
-    async evaluateImages({ prompt, candidates }) {
+    async evaluateImages({ prompt, candidates, signal }) {
+      throwIfCancelled(signal);
       if (!Array.isArray(candidates) || candidates.length === 0) throw new TypeError('candidates are required');
       const content = [{
         type: 'text',
@@ -373,6 +494,7 @@ export function createOpenAICompatibleVisionRanker({ baseUrl, apiKey, model, fet
       }
       const response = await fetchImpl(`${endpoint}/chat/completions`, {
         method: 'POST',
+        signal,
         headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
         body: JSON.stringify({
           model: modelName,
@@ -405,8 +527,14 @@ export function createSource3DAssetTool(deps) {
       required: ['prompt'],
       additionalProperties: false
     },
-    async execute({ prompt, candidateCount = 4 }) {
-      const result = await runSource3DAsset({ prompt, candidateCount }, deps);
+    async execute({ prompt, candidateCount = 4 }, { signal } = {}) {
+      const result = await runSource3DAsset({ prompt, candidateCount }, deps, { signal });
+      if (result.state.phase === 'cancelled') {
+        const error = new Error(result.state.cancellation?.message ?? 'workflow cancelled');
+        error.code = 'workflow_cancelled';
+        error.retryable = false;
+        throw error;
+      }
       if (result.state.phase === 'failed') {
         const error = new Error(result.state.error.message);
         error.code = result.state.error.code;
@@ -473,12 +601,20 @@ export function createModal3DAdapter({
     fetchImpl
   });
 
-  async function wait(jobId) {
+  async function wait(jobId, signal) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const state = await jsonRequest(fetchImpl, `${base}/v1/jobs/${encodeURIComponent(jobId)}`, {
-        headers: modal3DHeaders(token)
-      });
+      if (signal?.aborted) await cancelAfterAbort(fetchImpl, base, jobId, modal3DHeaders(token), signal);
+      let state;
+      try {
+        state = await jsonRequest(fetchImpl, `${base}/v1/jobs/${encodeURIComponent(jobId)}`, {
+          headers: modal3DHeaders(token),
+          signal
+        });
+      } catch (error) {
+        if (signal?.aborted || error?.name === 'AbortError') await cancelAfterAbort(fetchImpl, base, jobId, modal3DHeaders(token), signal);
+        throw error;
+      }
       if (state.status === 'succeeded') return state;
       if (['failed', 'cancelled', 'expired'].includes(state.status)) {
         const error = new Error(`modal-3D job ${jobId} ended as ${state.status}`);
@@ -486,7 +622,12 @@ export function createModal3DAdapter({
         error.retryable = Boolean(state.retryable);
         throw error;
       }
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+      try {
+        await delayOrCancel(pollIntervalMs, signal);
+      } catch (error) {
+        if (error?.code === 'workflow_cancelled') await cancelAfterAbort(fetchImpl, base, jobId, modal3DHeaders(token), signal);
+        throw error;
+      }
     }
     const error = new Error(`modal-3D job ${jobId} timed out`);
     error.code = 'three_d_timeout';
@@ -496,7 +637,8 @@ export function createModal3DAdapter({
 
   return {
     preflight,
-    async generate3D({ candidate }) {
+    async generate3D({ candidate, signal }) {
+      throwIfCancelled(signal);
       if (!candidate || typeof candidate !== 'object') throw new TypeError('candidate is required');
       if (!Buffer.isBuffer(candidate.data)) throw new TypeError('candidate.data must be a Buffer');
       const mediaType = candidate.mediaType ?? 'image/png';
@@ -504,7 +646,8 @@ export function createModal3DAdapter({
       if (!extension) throw new TypeError(`unsupported 3D source media type: ${mediaType}`);
       const sourceSha256 = createHash('sha256').update(candidate.data).digest('hex');
       if (candidate.sha256 && candidate.sha256 !== sourceSha256) throw new Error(`candidate digest mismatch: ${candidate.id ?? 'unknown'}`);
-      await preflight();
+      await preflight(signal);
+      throwIfCancelled(signal);
       const identity = createHash('sha256')
         .update(`${model}\0${profile}\0${seed}\0${sourceSha256}`)
         .digest('hex')
@@ -517,14 +660,22 @@ export function createModal3DAdapter({
       form.append('seed', String(seed));
       form.append('job_id', jobId);
 
-      await jsonRequest(fetchImpl, `${base}/v1/jobs`, {
-        method: 'POST',
-        headers: modal3DHeaders(token),
-        body: form
-      });
-      const state = await wait(jobId);
+      try {
+        await jsonRequest(fetchImpl, `${base}/v1/jobs`, {
+          method: 'POST',
+          headers: modal3DHeaders(token),
+          body: form,
+          signal
+        });
+      } catch (error) {
+        if (signal?.aborted || error?.name === 'AbortError') await cancelAfterAbort(fetchImpl, base, jobId, modal3DHeaders(token), signal);
+        throw error;
+      }
+      const state = await wait(jobId, signal);
+      throwIfCancelled(signal);
       const response = await fetchImpl(`${base}/v1/jobs/${encodeURIComponent(jobId)}/artifact`, {
-        headers: modal3DHeaders(token)
+        headers: modal3DHeaders(token),
+        signal
       });
       if (!response.ok) throw new Error(`modal-3D artifact ${jobId} failed with HTTP ${response.status}`);
       const data = Buffer.from(await response.arrayBuffer());

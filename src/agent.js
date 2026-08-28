@@ -34,6 +34,13 @@ function serializeToolObservation(value) {
   return JSON.stringify(value);
 }
 
+function agentCancellationMessage(signal) {
+  const reason = signal?.reason;
+  if (reason instanceof Error && reason.message) return reason.message;
+  if (typeof reason === 'string' && reason.trim()) return reason.trim();
+  return 'agent run cancelled';
+}
+
 function normalizeTools(tools) {
   if (!tools || typeof tools !== 'object' || Array.isArray(tools)) throw new TypeError('tools must be an object');
   return Object.fromEntries(Object.entries(tools).map(([name, tool]) => {
@@ -55,7 +62,7 @@ export function toolDefinitions(tools) {
   }));
 }
 
-export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPrompt, checkpoint } = {}) {
+export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPrompt, checkpoint, signal } = {}) {
   const userTask = requireText(task, 'task');
   if (typeof gateway !== 'function') throw new TypeError('gateway is required');
   if (checkpoint != null && typeof checkpoint !== 'function') throw new TypeError('checkpoint must be a function');
@@ -71,8 +78,30 @@ export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPromp
   ];
   const trace = [];
 
+  async function finishCancelled(step) {
+    const message = agentCancellationMessage(signal);
+    const result = { status: 'cancelled', message, steps: step, trace };
+    await checkpoint?.({
+      status: result.status,
+      task: userTask,
+      step,
+      message,
+      messages: structuredClone(messages),
+      trace: structuredClone(trace)
+    });
+    return result;
+  }
+
   for (let step = 1; step <= maxSteps; step++) {
-    const response = await gateway({ messages: structuredClone(messages), tools: definitions });
+    if (signal?.aborted) return finishCancelled(step - 1);
+    let response;
+    try {
+      response = await gateway({ messages: structuredClone(messages), tools: definitions, signal });
+    } catch (error) {
+      if (signal?.aborted || error?.name === 'AbortError') return finishCancelled(step - 1);
+      throw error;
+    }
+    if (signal?.aborted) return finishCancelled(step);
     if (!response || typeof response !== 'object') throw new TypeError('gateway returned an invalid response');
     const toolCalls = Array.isArray(response.toolCalls) ? response.toolCalls : [];
     const message = typeof response.message === 'string' ? response.message : '';
@@ -98,6 +127,7 @@ export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPromp
     });
 
     for (const call of toolCalls) {
+      if (signal?.aborted) return finishCancelled(step);
       const name = requireText(call?.name, 'tool call name');
       const tool = normalizedTools[name];
       if (!tool) {
@@ -111,7 +141,7 @@ export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPromp
       let result;
       let content;
       try {
-        result = { success: true, result: await tool.execute(args) };
+        result = { success: true, result: await tool.execute(args, { signal }) };
         content = serializeToolObservation(result);
         trace.push({ step, type: 'tool', name, success: true });
       } catch (error) {
@@ -127,8 +157,10 @@ export async function runAgent({ task, gateway, tools, maxSteps = 8, systemPromp
         trace.push({ step, type: 'tool', name, success: false, code: result.error.code });
       }
       messages.push({ role: 'tool', toolCallId: call.id ?? null, name, content });
+      if (result.success === false && result.error?.code === 'workflow_cancelled') return finishCancelled(step);
     }
 
+    if (signal?.aborted) return finishCancelled(step);
     await checkpoint?.({
       status: 'running',
       task: userTask,
@@ -197,11 +229,12 @@ export function createOpenAICompatibleAgentGateway({ baseUrl, apiKey, model, fet
   const key = requireText(apiKey, 'apiKey');
   const modelName = requireText(model, 'model');
 
-  return async ({ messages, tools }) => {
+  return async ({ messages, tools, signal }) => {
     if (!Array.isArray(messages)) throw new TypeError('messages are required');
     if (!Array.isArray(tools)) throw new TypeError('tools are required');
     const response = await fetchImpl(`${endpoint}/chat/completions`, {
       method: 'POST',
+      signal,
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
       body: JSON.stringify({
         model: modelName,

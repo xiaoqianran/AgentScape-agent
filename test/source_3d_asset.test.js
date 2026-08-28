@@ -124,6 +124,26 @@ test('imperative shell turns invalid effect results into explicit invariant fail
   assert.equal(result.trace.at(-1).causedBy, 'candidate_selected');
 });
 
+test('source_3d_asset pre-aborted run becomes cancelled without side effects', async () => {
+  const controller = new AbortController();
+  controller.abort(new Error('user cancelled'));
+  let calls = 0;
+  const result = await runSource3DAsset(
+    { prompt: 'red apple' },
+    {
+      async generateImages() { calls += 1; return []; },
+      async evaluateImages() { calls += 1; },
+      async generate3D() { calls += 1; },
+      async publishAsset() { calls += 1; }
+    },
+    { signal: controller.signal }
+  );
+  assert.equal(result.state.phase, 'cancelled');
+  assert.equal(result.state.cancellation.code, 'workflow_cancelled');
+  assert.equal(result.state.cancellation.message, 'user cancelled');
+  assert.equal(calls, 0);
+});
+
 test('imperative shell turns effect errors into explicit failed state', async () => {
   const result = await runSource3DAsset(
     { prompt: 'red apple' },
@@ -220,6 +240,37 @@ test('modal-2D capability preflight rejects unavailable model before job submit'
   });
   await assert.rejects(() => adapter.preflight(), (error) => error.code === 'capability_unavailable');
   assert.equal(jobRequests, 0);
+});
+
+test('modal-2D adapter cancels a running Sidecar job on AbortSignal', async () => {
+  const controller = new AbortController();
+  const deletes = [];
+  const adapter = createModal2DAdapter({
+    endpoint: 'http://sidecar.test',
+    pollIntervalMs: 0,
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/v1/models')) {
+        return new Response(JSON.stringify({ models: [{ id: 'sana-sprint-1.6b' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (url.endsWith('/v1/jobs') && init.method === 'POST') {
+        return new Response(JSON.stringify({ status: 'running' }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (init.method === 'DELETE') {
+        deletes.push(url);
+        return new Response(JSON.stringify({ status: 'cancel_requested' }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (/\/v1\/jobs\/agent2d_/.test(url)) {
+        controller.abort(new Error('user cancelled images'));
+        return new Response(JSON.stringify({ status: 'running' }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }
+  });
+  await assert.rejects(
+    () => adapter.generateImages({ prompt: 'red apple', count: 1, signal: controller.signal }),
+    (error) => error.code === 'workflow_cancelled' && error.message === 'user cancelled images'
+  );
+  assert.equal(deletes.length, 1);
 });
 
 test('OpenAI-compatible VLM adapter sends multimodal candidates and validates selected id', async () => {
@@ -434,4 +485,41 @@ test('modal-3D capability preflight rejects unavailable model and profile before
   });
   await assert.rejects(() => missingProfile.preflight(), (error) => error.code === 'capability_unavailable');
   assert.equal(jobRequests, 0);
+});
+
+
+test('modal-3D adapter cancels deterministic job when submit is aborted in flight', async () => {
+  const controller = new AbortController();
+  const source = Buffer.from('candidate-image');
+  const sha256 = createHash('sha256').update(source).digest('hex');
+  const deletes = [];
+  let postSignal;
+  const adapter = createModal3DAdapter({
+    endpoint: 'http://sidecar3d.test',
+    pollIntervalMs: 0,
+    fetchImpl: async (url, init = {}) => {
+      if (url.endsWith('/v1/models')) {
+        return new Response(JSON.stringify({ models: [{ id: 'fastsam3d-plus-plus', status: 'enabled', profiles: [{ id: 'recommended' }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (url.endsWith('/v1/jobs') && init.method === 'POST') {
+        postSignal = init.signal;
+        queueMicrotask(() => controller.abort(new Error('cancel during submit')));
+        return new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+        });
+      }
+      if (init.method === 'DELETE') {
+        deletes.push(url);
+        return new Response(JSON.stringify({ status: 'cancel_requested' }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      throw new Error(`unexpected request: ${url}`);
+    }
+  });
+  await assert.rejects(
+    () => adapter.generate3D({ candidate: { id: 'img', mediaType: 'image/png', sha256, data: source }, signal: controller.signal }),
+    (error) => error.code === 'workflow_cancelled' && error.message === 'cancel during submit'
+  );
+  assert.equal(postSignal, controller.signal);
+  assert.equal(deletes.length, 1);
+  assert.match(deletes[0], /\/v1\/jobs\/agent3d_/);
 });

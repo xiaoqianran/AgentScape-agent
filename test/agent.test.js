@@ -43,6 +43,25 @@ test('agent exposes only high-level tool definitions and completes after observa
   assert.deepEqual(result.trace.map(({ type }) => type), ['tool', 'final']);
 });
 
+test('pre-aborted Agent Run checkpoints cancelled without calling the model', async () => {
+  const controller = new AbortController();
+  controller.abort(new Error('user cancelled agent'));
+  let gatewayCalls = 0;
+  const checkpoints = [];
+  const result = await runAgent({
+    task: 'make an apple',
+    signal: controller.signal,
+    checkpoint: async (snapshot) => checkpoints.push(snapshot),
+    tools: { source_3d_asset: sourceTool(async () => ({ assetId: 'never' })) },
+    gateway: async () => { gatewayCalls += 1; return { message: 'never', toolCalls: [] }; }
+  });
+  assert.equal(result.status, 'cancelled');
+  assert.equal(result.steps, 0);
+  assert.equal(result.message, 'user cancelled agent');
+  assert.equal(gatewayCalls, 0);
+  assert.deepEqual(checkpoints.map(({ status }) => status), ['cancelled']);
+});
+
 test('agent turns unknown tools into observations instead of executing arbitrary names', async () => {
   let step = 0;
   const result = await runAgent({
@@ -59,6 +78,36 @@ test('agent turns unknown tools into observations instead of executing arbitrary
   assert.equal(result.status, 'completed');
   assert.equal(result.trace[0].success, false);
   assert.equal(result.trace[0].code, 'tool_not_found');
+});
+
+test('Agent Run cancellation inside a tool stops before the next model step', async () => {
+  const controller = new AbortController();
+  const checkpoints = [];
+  let gatewayCalls = 0;
+  const result = await runAgent({
+    task: 'make an apple',
+    signal: controller.signal,
+    checkpoint: async (snapshot) => checkpoints.push(snapshot),
+    tools: {
+      source_3d_asset: sourceTool(async (_args, context) => {
+        assert.equal(context.signal, controller.signal);
+        controller.abort(new Error('cancel during tool'));
+        const error = new Error('cancel during tool');
+        error.code = 'workflow_cancelled';
+        error.retryable = false;
+        throw error;
+      })
+    },
+    gateway: async () => {
+      gatewayCalls += 1;
+      return { message: '', toolCalls: [{ id: 'call-1', name: 'source_3d_asset', args: { prompt: 'apple' } }] };
+    }
+  });
+  assert.equal(result.status, 'cancelled');
+  assert.equal(result.message, 'cancel during tool');
+  assert.equal(gatewayCalls, 1);
+  assert.equal(result.trace.at(-1).code, 'workflow_cancelled');
+  assert.equal(checkpoints.at(-1).status, 'cancelled');
 });
 
 test('agent records tool failures as structured observations', async () => {
