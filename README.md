@@ -132,7 +132,7 @@ runaway tool loop             PASS → maxSteps
 ```text
 Agent trajectory replay   5 cases
 Workflow replay           5 cases
-Unit / contract tests     20 tests
+Unit / contract tests     29 tests
 ```
 
 ## Verified modal-3D Sidecar Adapter
@@ -190,3 +190,54 @@ modal-3D  fastsam3d-plus-plus/recommended   enabled
 ```
 
 未知 model/profile 会在提交 Job 前 fail-closed；本地图片 digest 错误甚至不会触发 capability 网络请求。
+
+
+## Verified One-shot Text → World
+
+2026-08-28 已完成不经过 `modal-inference-hub` / Connector 的真实一次到底链路：
+
+```text
+Text
+  ↓
+modal-2D-client / SANA-Sprint 1.6B
+  ↓
+automatic candidate selection
+  ↓
+modal-3D-client / FastSAM3D++
+  ↓
+verified GLB
+  ↓
+AgentScape ArtifactRegistry + SHA-256 verify
+  ↓
+AssetCompiler / Asset admission
+  ↓
+canonical WorldPipeline
+  ↓
+ON table placement
+  ↓
+WorldRuntime support verification
+```
+
+运行入口：
+
+```bash
+AGENT_ONE_SHOT_2D_TOKEN=... \
+AGENT_ONE_SHOT_3D_TOKEN=... \
+npm run experiment:world
+```
+
+真实结果：
+
+```text
+status               completed
+stage                verified
+elapsed              206.432 s
+GLB bytes            7,853,800
+GLB SHA-256          120a9658ffad6a6c3d7232b9a717ce9737279334d87ce04b245c8e5085b0422e
+Asset admission      provisional (BUDGET_RENDER_VERTICES)
+World admission      provisional (ASSET_PROVISIONAL)
+relation admission   ready
+ON table             verified
+```
+
+`provisional` 不等于失败：当前生成 GLB 超过既有 render-vertex 预算，因此 Asset 保持 provisional；World 继承该 admission，但空间关系与 Runtime 支撑验证均通过。One-shot 只在 `world.verified=true` 时返回 `completed`。

@@ -4,3 +4,4 @@ node_modules/
 !.env.example
 results/
 .DS_Store
+experiments/results/
