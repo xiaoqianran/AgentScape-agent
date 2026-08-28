@@ -132,7 +132,7 @@ runaway tool loop             PASS → maxSteps
 ```text
 Agent trajectory replay   5 cases
 Workflow replay           5 cases
-Unit / contract tests     29 tests
+Unit / contract tests     34 tests
 ```
 
 ## Verified modal-3D Sidecar Adapter
@@ -241,3 +241,52 @@ ON table             verified
 ```
 
 `provisional` 不等于失败：当前生成 GLB 超过既有 render-vertex 预算，因此 Asset 保持 provisional；World 继承该 admission，但空间关系与 Runtime 支撑验证均通过。One-shot 只在 `world.verified=true` 时返回 `completed`。
+
+
+## Verified Cancellation Propagation
+
+2026-08-28 已把用户取消从 Agent Run 贯穿到真实 2D/3D Sidecar：
+
+```text
+AbortSignal
+   ↓
+Agent Run
+   ↓
+high-level Tool
+   ↓
+source_3d_asset
+   ↓
+2D / VLM / 3D adapter
+   ↓
+DELETE deterministic jobId
+   ↓
+Sidecar cancel_requested
+   ↓
+remote cancellation
+   ↓
+cancelled
+```
+
+关键语义：
+
+```text
+pre-abort                     → 0 LLM / 0 Provider side effects
+cancel during Tool            → Agent 不再进入下一轮 LLM
+cancel during 2D submit/poll  → Sidecar cancel_requested
+cancel during 3D submit/poll  → Sidecar cancelled / remote.cancelled
+checkpoint                    → status=cancelled
+```
+
+真实验证：
+
+```text
+2D jobId      agent2d_9f0b6f515b54d6a0b9775a27
+2D final      cancel_requested
+3D jobId      agent3d_bf6c61e8ca725a8bd7b1e7b0
+3D appeared   running
+3D final      cancelled
+3D errorCode  remote.cancelled
+3D retryable  false
+```
+
+为保证 submit-in-flight 期间仍可取消，2D/3D Sidecar 都保留 `cancel_requested` 意图；3D Sidecar 的阻塞 submit 已移入 threadpool，避免 async HTTP event loop 被 Modal I/O 卡死。
