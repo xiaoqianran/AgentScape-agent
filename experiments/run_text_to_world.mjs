@@ -241,13 +241,20 @@ const output = {
   request: result.request,
   source: {
     phase: result.source.state.phase,
+    error: result.source.state.error,
     candidates: result.source.state.candidates,
     selectedId: result.source.state.selectedId,
     ranking: ranking ? { model: vlmModel, ...ranking } : null,
     artifact: result.source.state.artifact,
     asset: result.source.state.asset
   },
-  world: result.world
+  world: result.world,
+  timings: {
+    ...result.timings,
+    candidates: result.source.state.candidates.map(({ id, seed, timing }) => ({ id, seed, ...timing })),
+    vlm: result.source.state.evaluation?.timing ?? ranking?.timing ?? null,
+    threeD: result.source.state.artifact?.timing ?? null
+  }
 };
 await writeFile(new URL('./results/latest.json', import.meta.url), `${JSON.stringify(output, null, 2)}\n`);
 console.log(JSON.stringify(output));

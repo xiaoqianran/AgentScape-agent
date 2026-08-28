@@ -44,9 +44,14 @@ test('checkpointed agent persists tool observation and terminal result', async (
 
   assert.equal(result.status, 'completed');
   assert.equal(result.runId, 'run_checkpoint');
-  assert.deepEqual(snapshots.map(({ status }) => status), ['created', 'running', 'completed']);
-  assert.equal(snapshots[1].trace[0].type, 'tool');
-  assert.equal(snapshots[2].trace.at(-1).type, 'final');
+  assert.deepEqual(snapshots.map(({ status }) => status), ['created', 'tool_pending', 'running', 'running', 'completed']);
+  assert.equal(snapshots[1].pendingTool.name, 'source_3d_asset');
+  assert.equal(snapshots[1].pendingTool.executionId, 'run_checkpoint__1__0__call-1__source_3d_asset');
+  assert.equal(snapshots[2].trace[0].type, 'tool');
+  assert.equal(snapshots.at(-1).trace.at(-1).type, 'final');
+  assert.ok(result.timings.some(({ kind }) => kind === 'gateway'));
+  assert.ok(result.timings.some(({ kind }) => kind === 'tool'));
+  assert.ok(result.timings.some(({ kind }) => kind === 'checkpoint'));
 });
 
 test('checkpoint failure stops the agent before another model step', async () => {
@@ -77,6 +82,70 @@ test('checkpoint failure stops the agent before another model step', async () =>
     /disk unavailable/
   );
   assert.equal(gatewayCalls, 1, 'agent must not continue after durable checkpoint failure');
+});
+
+test('checkpointed agent automatically resumes a pending tool with the same execution id', async () => {
+  const executionId = 'run_resume__1__0__call-1__source_3d_asset';
+  let record = {
+    version: 1,
+    runId: 'run_resume',
+    status: 'tool_pending',
+    phase: 'tools',
+    task: 'make an apple',
+    step: 1,
+    nextStep: 1,
+    messages: [
+      { role: 'system', content: 'system' },
+      { role: 'user', content: 'make an apple' },
+      { role: 'assistant', content: '', toolCalls: [{ id: 'call-1', name: 'source_3d_asset', args: { prompt: 'apple' } }] }
+    ],
+    trace: [],
+    timings: [],
+    toolBatch: {
+      step: 1,
+      nextIndex: 0,
+      calls: [{ id: 'call-1', name: 'source_3d_asset', args: { prompt: 'apple' }, executionId }]
+    },
+    pendingTool: { index: 0, id: 'call-1', name: 'source_3d_asset', args: { prompt: 'apple' }, executionId }
+  };
+  const saves = [];
+  const store = {
+    async load() { return structuredClone(record); },
+    async save(_runId, snapshot) {
+      record = { version: 1, runId: 'run_resume', ...structuredClone(snapshot) };
+      saves.push(structuredClone(record));
+    }
+  };
+  let toolCalls = 0;
+  let gatewayCalls = 0;
+  const result = await runCheckpointedAgent({
+    runId: 'run_resume',
+    store,
+    task: 'make an apple',
+    tools: {
+      source_3d_asset: {
+        description: 'source a 3D asset',
+        async execute(args, context) {
+          toolCalls += 1;
+          assert.deepEqual(args, { prompt: 'apple' });
+          assert.equal(context.executionId, executionId);
+          assert.equal(context.recovered, true);
+          return { assetId: 'asset-recovered' };
+        }
+      }
+    },
+    gateway: async ({ messages }) => {
+      gatewayCalls += 1;
+      assert.match(messages.at(-1).content, /asset-recovered/);
+      return { message: 'recovered and done', toolCalls: [] };
+    }
+  });
+  assert.equal(result.resumed, true);
+  assert.equal(result.status, 'completed');
+  assert.equal(toolCalls, 1);
+  assert.equal(gatewayCalls, 1, 'resume must execute pending tool before asking the model again');
+  assert.ok(result.trace.some((entry) => entry.type === 'tool' && entry.recovered === true && entry.executionId === executionId));
+  assert.ok(saves.some(({ status }) => status === 'tool_pending'));
 });
 
 test('file run store rejects path-like run ids', async () => {

@@ -341,3 +341,75 @@ ON table                 verified
 ```
 
 另外修正了 `modal-2D-client` 的调用语义：Sidecar 的 `job_id` 是唯一 ID，而不是幂等 request key，因此 `createModal2DAdapter()` 现在为每次 `generateImages()` 调用创建独立 run scope；同一次调用中的候选仍稳定可追踪，不同 Run 不再复用历史中断 job。
+
+## Verified Cross-process Resume + Timing Baseline
+
+2026-08-28 已验证跨进程 Tool resume：进程 A 在 `tool_pending` 后故意 `exit=86`，进程 B 使用同一个 `runId / executionId` 自动恢复，不重新询问 LLM，也不创建重复 Sidecar Job。
+
+```text
+Process A crash window       39.099 ms
+Process B resume process     38.681 ms
+RunStore load                 0.228 ms
+pendingTool checkpoint        0.977 ms
+recovered Tool execution      0.570 ms
+Tool-complete checkpoint      0.459 ms
+gateway-ready checkpoint     0.299 ms
+next Gateway                  0.095 ms
+terminal checkpoint           1.034 ms
+```
+
+恢复模型：
+
+```text
+checkpoint pendingTool
+        │
+        ├─ runId
+        ├─ executionId
+        ├─ tool name / args
+        └─ nextToolIndex
+        │
+        ▼
+process restart
+        │
+        ▼
+load checkpoint
+        │
+        ▼
+same executionId
+        │
+        ├─ 2D Sidecar existing-job lookup / rebind
+        └─ 3D Sidecar existing-job lookup / rebind
+```
+
+同日完成真实生产链 timing 基准：
+
+```text
+total one-shot                 510,344.586 ms   510.345 s
+4-image generation slice        54,198.521 ms    54.199 s
+VLM ranking                    277,882.501 ms   277.883 s
+3D generation                  177,445.324 ms   177.445 s
+Asset publish                      562.969 ms     0.563 s
+World build + runtime verify       253.733 ms     0.254 s
+```
+
+四个 2D candidate 的细分：
+
+| Seed | Preflight | Lookup | Submit | Wait | Artifact fetch | Total |
+|---:|---:|---:|---:|---:|---:|---:|
+| 42 | 6234.827 ms | 4.797 ms | 1844.657 ms | 39095.985 ms | 6.101 ms | 47186.995 ms |
+| 73 | 6220.083 ms | 4.702 ms | 5030.794 ms | 38239.003 ms | 5.472 ms | 49500.553 ms |
+| 104 | 6220.439 ms | 4.542 ms | 6338.546 ms | 41614.371 ms | 4.186 ms | 54182.536 ms |
+| 135 | 6220.795 ms | 4.350 ms | 7608.284 ms | 38780.914 ms | 4.230 ms | 52619.303 ms |
+
+3D 细分：
+
+```text
+preflight            4.036 ms
+existing-job lookup  1.471 ms
+submit            7062.667 ms
+wait            170346.305 ms
+artifact fetch       24.632 ms
+total            177445.086 ms
+```
+
+本轮 profiling 还暴露并修复了真实 2D submit 并发压力：候选 Job 的 `lookup + POST submit` 现在串行化握手，而远端 GPU `wait/poll` 仍保持并行，因此避免本地 Sidecar/Modal session submit 竞争，不牺牲四图生成并行度。

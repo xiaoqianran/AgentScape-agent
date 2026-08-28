@@ -8,11 +8,12 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node --check src/agent.js && node --check src/source_3d_asset.js && node --check src/run_text_to_world.js && node --check src/runs.js && node --check experiments/source_3d_asset.mjs && node --check experiments/source_3d_asset_eval.mjs && node --check experiments/agent_eval.mjs && node --check experiments/modal_3d_adapter.mjs && node --check experiments/run_text_to_world.mjs && node --test && node experiments/source_3d_asset_eval.mjs && node experiments/agent_eval.mjs",
+    "check": "node --check src/agent.js && node --check src/source_3d_asset.js && node --check src/run_text_to_world.js && node --check src/runs.js && node --check experiments/source_3d_asset.mjs && node --check experiments/source_3d_asset_eval.mjs && node --check experiments/agent_eval.mjs && node --check experiments/modal_3d_adapter.mjs && node --check experiments/run_text_to_world.mjs && node --check experiments/run_resume.mjs && node --test && node experiments/source_3d_asset_eval.mjs && node experiments/agent_eval.mjs",
     "experiment:source3d": "node experiments/source_3d_asset.mjs",
     "eval:source3d": "node experiments/source_3d_asset_eval.mjs",
     "eval:agent": "node experiments/agent_eval.mjs",
     "experiment:modal3d": "node experiments/modal_3d_adapter.mjs",
-    "experiment:world": "node experiments/run_text_to_world.mjs"
+    "experiment:world": "node experiments/run_text_to_world.mjs",
+    "experiment:resume": "node experiments/run_resume.mjs"
   }
 }

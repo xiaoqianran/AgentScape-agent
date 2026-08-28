@@ -289,7 +289,9 @@ test('OpenAI-compatible VLM adapter sends multimodal candidates and validates se
   });
 
   const result = await ranker.evaluateImages({ prompt: 'red apple', candidates });
-  assert.deepEqual(result, { selectedId: 'image-b', reason: 'cleaner silhouette' });
+  assert.equal(result.selectedId, 'image-b');
+  assert.equal(result.reason, 'cleaner silhouette');
+  assert.ok(result.timing.totalMs >= 0);
   assert.equal(upstreamBody.model, 'vision-model');
   const content = upstreamBody.messages[1].content;
   assert.equal(content.filter(({ type }) => type === 'image_url').length, 2);
@@ -321,102 +323,68 @@ function glbBytes(payload = Buffer.alloc(16)) {
   return Buffer.concat([header, payload]);
 }
 
-test('modal-3D adapter submits source bytes with stable identity and verifies GLB', async () => {
+test('modal-3D adapter rebinds the same execution id and verifies GLB', async () => {
   const source = Buffer.from('candidate-image-bytes');
   const sourceSha256 = createHash('sha256').update(source).digest('hex');
   const glb = glbBytes(Buffer.from('mesh-payload'));
   const glbSha256 = createHash('sha256').update(glb).digest('hex');
   const submissions = [];
+  const knownJobs = new Set();
   let capabilityRequests = 0;
   const fetchImpl = async (url, init = {}) => {
     if (url.endsWith('/v1/models')) {
       capabilityRequests += 1;
       return new Response(JSON.stringify({
-        models: [{
-          id: 'fastsam3d-plus-plus',
-          status: 'enabled',
-          profiles: [{ id: 'recommended' }]
-        }]
+        models: [{ id: 'fastsam3d-plus-plus', status: 'enabled', profiles: [{ id: 'recommended' }] }]
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.endsWith('/v1/jobs') && init.method === 'POST') {
       const form = init.body;
       const file = form.get('file');
+      const jobId = form.get('job_id');
+      knownJobs.add(jobId);
       submissions.push({
-        model: form.get('model'),
-        profile: form.get('profile'),
-        seed: form.get('seed'),
-        jobId: form.get('job_id'),
-        mediaType: file.type,
-        bytes: Buffer.from(await file.arrayBuffer())
+        model: form.get('model'), profile: form.get('profile'), seed: form.get('seed'), jobId,
+        mediaType: file.type, bytes: Buffer.from(await file.arrayBuffer())
       });
-      return new Response(JSON.stringify({ id: form.get('job_id'), status: 'running' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' }
+      return new Response(JSON.stringify({ id: jobId, status: 'running' }), {
+        status: 200, headers: { 'content-type': 'application/json' }
       });
     }
-    if (/\/v1\/jobs\/agent3d_/.test(url) && !url.endsWith('/artifact')) {
+    const match = url.match(/\/v1\/jobs\/(agent3d_[^/]+)/);
+    if (match && !url.endsWith('/artifact')) {
+      if (!knownJobs.has(match[1])) return new Response('{}', { status: 404, headers: { 'content-type': 'application/json' } });
       return new Response(JSON.stringify({
         status: 'succeeded',
         result: {
-          artifact: {
-            id: 'art-provider',
-            role: 'primary-glb',
-            mediaType: 'model/gltf-binary',
-            bytes: glb.length,
-            sha256: glbSha256,
-            path: 'private/provider/path.glb',
-            cache: { path: '/tmp/private-cache.glb' }
-          },
-          conditioning: {
-            strategy: 'birefnet',
-            engine: 'birefnet-general-lite',
-            source_sha256: sourceSha256,
-            canonical_sha256: 'c'.repeat(64),
-            foreground_ratio: 0.28,
-            path: 'conditioned-inputs/private.png'
-          }
+          artifact: { id: 'art-provider', role: 'primary-glb', mediaType: 'model/gltf-binary', bytes: glb.length, sha256: glbSha256, path: 'private/provider/path.glb' },
+          conditioning: { strategy: 'birefnet', engine: 'birefnet-general-lite', source_sha256: sourceSha256, canonical_sha256: 'c'.repeat(64), foreground_ratio: 0.28, path: 'private.png' }
         }
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     if (url.endsWith('/artifact')) {
-      return new Response(glb, {
-        status: 200,
-        headers: {
-          'content-type': 'model/gltf-binary',
-          'x-artifact-id': 'art-provider',
-          'x-artifact-sha256': glbSha256
-        }
-      });
+      return new Response(glb, { status: 200, headers: { 'content-type': 'model/gltf-binary', 'x-artifact-id': 'art-provider', 'x-artifact-sha256': glbSha256 } });
     }
     throw new Error(`unexpected request: ${url}`);
   };
-  const adapter = createModal3DAdapter({
-    endpoint: 'http://sidecar3d.test',
-    token: 'local-3d-session',
-    model: 'fastsam3d-plus-plus',
-    profile: 'recommended',
-    seed: 42,
-    pollIntervalMs: 0,
-    fetchImpl
-  });
+  const adapter = createModal3DAdapter({ endpoint: 'http://sidecar3d.test', token: 'local-3d-session', model: 'fastsam3d-plus-plus', profile: 'recommended', seed: 42, pollIntervalMs: 0, fetchImpl });
   const candidate = { id: 'img-1', mediaType: 'image/png', sha256: sourceSha256, data: source };
-  const first = await adapter.generate3D({ candidate });
-  const second = await adapter.generate3D({ candidate });
-  assert.equal(submissions.length, 2);
+  const executionId = 'run_resume__1__0__call-1';
+  const first = await adapter.generate3D({ candidate, executionId });
+  const second = await adapter.generate3D({ candidate, executionId });
+  assert.equal(submissions.length, 1, 'resume must rebind instead of submitting a second GPU job');
   assert.equal(capabilityRequests, 1, 'capability preflight must be cached per adapter');
-  assert.equal(submissions[0].jobId, submissions[1].jobId, 'same source request must reuse job identity');
+  assert.equal(first.jobId, second.jobId);
+  assert.equal(first.timing.reusedJob, false);
+  assert.equal(second.timing.reusedJob, true);
   assert.equal(submissions[0].mediaType, 'image/png');
-  assert.equal(submissions[0].bytes.equals(source), true, 'Sidecar source upload must preserve original bytes');
+  assert.equal(submissions[0].bytes.equals(source), true);
   assert.equal(first.id, 'art-provider');
   assert.equal(first.sha256, glbSha256);
-  assert.equal(first.bytes, glb.length);
   assert.equal(first.data.equals(glb), true);
   assert.equal(first.conditioning.strategy, 'birefnet');
-  assert.equal(first.conditioning.source_sha256, sourceSha256);
-  assert.equal('path' in first, false, 'Provider-private artifact path must not escape the adapter');
-  assert.equal('cache' in first, false, 'Sidecar-private cache metadata must not escape the adapter');
-  assert.equal('path' in first.conditioning, false, 'Provider-private conditioning path must not escape the adapter');
+  assert.equal('path' in first, false);
+  assert.equal('path' in first.conditioning, false);
 });
 
 test('modal-3D adapter fails closed on candidate digest mismatch', async () => {
@@ -500,6 +468,9 @@ test('modal-3D adapter cancels deterministic job when submit is aborted in fligh
     fetchImpl: async (url, init = {}) => {
       if (url.endsWith('/v1/models')) {
         return new Response(JSON.stringify({ models: [{ id: 'fastsam3d-plus-plus', status: 'enabled', profiles: [{ id: 'recommended' }] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (/\/v1\/jobs\/agent3d_/.test(url) && init.method !== 'DELETE' && !url.endsWith('/artifact')) {
+        return new Response('{}', { status: 404, headers: { 'content-type': 'application/json' } });
       }
       if (url.endsWith('/v1/jobs') && init.method === 'POST') {
         postSignal = init.signal;

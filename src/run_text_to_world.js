@@ -66,29 +66,50 @@ export function decideTextToWorldCompletion(sourceResult, worldResult) {
 
 export async function runTextToWorld(request, deps = {}) {
   if (typeof deps.buildWorld !== 'function') throw new TypeError('deps.buildWorld is required');
+  const totalStarted = performance.now();
+  const startedAt = new Date().toISOString();
   const normalized = normalizeTextToWorldRequest(request);
   const source = await runSource3DAsset(
     { prompt: normalized.prompt, candidateCount: normalized.candidateCount },
     {
       ...deps,
-      publishAsset: ({ prompt, artifact }) => deps.publishAsset({
+      publishAsset: ({ prompt, artifact, executionId }) => deps.publishAsset({
         prompt,
         artifact,
-        assetId: normalized.assetId
+        assetId: normalized.assetId,
+        executionId
       })
-    }
+    },
+    { executionId: deps.executionId }
   );
+
+  const sourceTimings = source.trace
+    .filter(({ durationMs }) => Number.isFinite(durationMs))
+    .map(({ phase, effects, startedAt: stageStartedAt, finishedAt, durationMs }) => ({
+      phase,
+      effect: effects?.[0] ?? null,
+      startedAt: stageStartedAt,
+      finishedAt,
+      durationMs
+    }));
 
   if (source.state.phase !== 'done') {
     return {
       ...decideTextToWorldCompletion(source, null),
       request: normalized,
       source,
-      world: null
+      world: null,
+      timings: {
+        startedAt,
+        source: sourceTimings,
+        worldMs: 0,
+        totalMs: Number((performance.now() - totalStarted).toFixed(3))
+      }
     };
   }
 
   let world;
+  const worldStarted = performance.now();
   try {
     world = await deps.buildWorld({
       prompt: normalized.prompt,
@@ -102,7 +123,8 @@ export async function runTextToWorld(request, deps = {}) {
       actor: {
         assetId: normalized.actorAssetId,
         instanceId: normalized.actorInstanceId
-      }
+      },
+      executionId: deps.executionId
     });
   } catch (error) {
     world = {
@@ -114,11 +136,18 @@ export async function runTextToWorld(request, deps = {}) {
       }
     };
   }
+  const worldMs = Number((performance.now() - worldStarted).toFixed(3));
 
   return {
     ...decideTextToWorldCompletion(source, world),
     request: normalized,
     source,
-    world
+    world,
+    timings: {
+      startedAt,
+      source: sourceTimings,
+      worldMs,
+      totalMs: Number((performance.now() - totalStarted).toFixed(3))
+    }
   };
 }
