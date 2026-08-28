@@ -167,7 +167,7 @@ test('imperative shell turns effect errors into explicit failed state', async ()
   });
 });
 
-test('modal-2D adapter submits deterministic jobs, polls, and verifies artifact digest', async () => {
+test('modal-2D adapter scopes job ids per generation run, polls, and verifies artifact digest', async () => {
   const requests = [];
   const image = Buffer.from('real-ish-png-bytes');
   const sha256 = createHash('sha256').update(image).digest('hex');
@@ -214,7 +214,7 @@ test('modal-2D adapter submits deterministic jobs, polls, and verifies artifact 
   const first = await adapter.generateImages({ prompt: 'red apple', count: 1 });
   const second = await adapter.generateImages({ prompt: 'red apple', count: 1 });
 
-  assert.equal(first[0].jobId, second[0].jobId, 'same request must produce stable job identity');
+  assert.notEqual(first[0].jobId, second[0].jobId, 'separate runs must not reuse a sidecar job id');
   assert.equal(first[0].sha256, sha256);
   assert.equal(first[0].id, 'art-1');
   assert.equal(first[0].data.equals(image), true);

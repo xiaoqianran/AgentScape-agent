@@ -1,7 +1,11 @@
 import { createHash } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import * as THREE from '../../AgentScape/node_modules/three/build/three.module.js';
-import { createModal2DAdapter, createModal3DAdapter } from '../src/source_3d_asset.js';
+import {
+  createModal2DAdapter,
+  createModal3DAdapter,
+  createOpenAICompatibleVisionRanker
+} from '../src/source_3d_asset.js';
 import { runTextToWorld } from '../src/run_text_to_world.js';
 import { createAssetModule } from '../../AgentScape/src/assets/createAssetModule.js';
 import { AssetCompiler } from '../../AgentScape/src/compiler/AssetCompiler.js';
@@ -21,6 +25,10 @@ const prompt = process.argv.slice(2).join(' ').trim()
 const token2D = process.env.AGENT_ONE_SHOT_2D_TOKEN;
 const token3D = process.env.AGENT_ONE_SHOT_3D_TOKEN;
 if (!token2D || !token3D) throw new Error('local Sidecar session tokens are required');
+const vlmBaseUrl = process.env.AGENTSCAPE_LLM_BASE_URL;
+const vlmApiKey = process.env.AGENTSCAPE_LLM_API_KEY;
+const vlmModel = process.env.AGENTSCAPE_LLM_MODEL ?? 'stepfun-ai/step-3.7-flash';
+if (!vlmBaseUrl || !vlmApiKey) throw new Error('VLM base URL and API key are required');
 
 const resultDir = new URL('./results/', import.meta.url);
 await mkdir(resultDir, { recursive: true });
@@ -197,6 +205,13 @@ const imageAdapter = createModal2DAdapter({
   model: 'sana-sprint-1.6b',
   pollIntervalMs: 500
 });
+const visionRanker = createOpenAICompatibleVisionRanker({
+  baseUrl: vlmBaseUrl,
+  apiKey: vlmApiKey,
+  model: vlmModel
+});
+let ranking = null;
+
 const model3DAdapter = createModal3DAdapter({
   endpoint: process.env.AGENT_ONE_SHOT_3D_ENDPOINT ?? 'http://127.0.0.1:3313',
   token: token3D,
@@ -207,13 +222,13 @@ const model3DAdapter = createModal3DAdapter({
 
 const startedAt = Date.now();
 const result = await runTextToWorld(
-  { prompt, candidateCount: 1 },
+  { prompt, candidateCount: 4 },
   {
     generateImages: imageAdapter.generateImages,
-    evaluateImages: async ({ candidates }) => ({
-      selectedId: candidates[0].id,
-      reason: 'single-candidate deterministic automatic selection'
-    }),
+    evaluateImages: async (input) => {
+      ranking = await visionRanker.evaluateImages(input);
+      return ranking;
+    },
     generate3D: model3DAdapter.generate3D,
     publishAsset: publishGeneratedArtifact,
     buildWorld: buildVerifiedWorld
@@ -226,7 +241,9 @@ const output = {
   request: result.request,
   source: {
     phase: result.source.state.phase,
+    candidates: result.source.state.candidates,
     selectedId: result.source.state.selectedId,
+    ranking: ranking ? { model: vlmModel, ...ranking } : null,
     artifact: result.source.state.artifact,
     asset: result.source.state.asset
   },

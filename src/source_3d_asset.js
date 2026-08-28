@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const TERMINAL_PHASES = new Set(['done', 'failed', 'cancelled']);
 const EFFECT = Object.freeze({
@@ -416,11 +416,14 @@ export function createModal2DAdapter({
     throw error;
   }
 
-  async function generateOne(prompt, seed, signal) {
+  async function generateOne(prompt, seed, runScope, signal) {
     throwIfCancelled(signal);
     await preflight(signal);
     throwIfCancelled(signal);
-    const identity = createHash('sha256').update(`${model}\0${seed}\0${prompt}`).digest('hex').slice(0, 24);
+    const identity = createHash('sha256')
+      .update(`${runScope}\0${model}\0${seed}\0${prompt}`)
+      .digest('hex')
+      .slice(0, 24);
     const jobId = `agent2d_${identity}`;
     try {
       await jsonRequest(fetchImpl, `${base}/v1/jobs`, {
@@ -461,7 +464,11 @@ export function createModal2DAdapter({
     async generateImages({ prompt, count = 4, signal }) {
       const normalized = requireText(prompt, 'prompt');
       throwIfCancelled(signal);
-      return Promise.all(Array.from({ length: count }, (_, index) => generateOne(normalized, baseSeed + index * 31, signal)));
+      const runScope = randomUUID();
+      return Promise.all(Array.from(
+        { length: count },
+        (_, index) => generateOne(normalized, baseSeed + index * 31, runScope, signal)
+      ));
     }
   };
 }

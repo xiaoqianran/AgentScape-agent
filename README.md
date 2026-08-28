@@ -290,3 +290,54 @@ checkpoint                    → status=cancelled
 ```
 
 为保证 submit-in-flight 期间仍可取消，2D/3D Sidecar 都保留 `cancel_requested` 意图；3D Sidecar 的阻塞 submit 已移入 threadpool，避免 async HTTP event loop 被 Modal I/O 卡死。
+
+## Verified Multi-candidate VLM One-shot
+
+在单候选 One-shot 基线之上，已验证真实多候选视觉选择链：
+
+```text
+Text
+  ↓
+4 × modal-2D-client / SANA-Sprint 1.6B
+  ↓
+OpenAI-compatible Vision Ranker
+  ↓
+stepfun-ai/step-3.7-flash
+  ↓
+selected candidate
+  ↓
+modal-3D-client / FastSAM3D++
+  ↓
+verified GLB → Asset → World → Runtime
+```
+
+运行时需要额外提供 OpenAI-compatible VLM 配置，凭据不写入仓库：
+
+```bash
+AGENTSCAPE_LLM_BASE_URL=... \
+AGENTSCAPE_LLM_API_KEY=... \
+AGENTSCAPE_LLM_MODEL=stepfun-ai/step-3.7-flash \
+AGENT_ONE_SHOT_2D_TOKEN=... \
+AGENT_ONE_SHOT_3D_TOKEN=... \
+npm run experiment:world
+```
+
+2026-08-28 真实结果：
+
+```text
+status                 completed
+stage                  verified
+elapsed                169.763 s
+candidateCount         4
+2D seeds               42 / 73 / 104 / 135
+VLM                     stepfun-ai/step-3.7-flash
+selected seed           42
+GLB bytes               7,853,800
+GLB SHA-256             120a9658ffad6a6c3d7232b9a717ce9737279334d87ce04b245c8e5085b0422e
+Asset admission         provisional (BUDGET_RENDER_VERTICES)
+World admission         provisional (ASSET_PROVISIONAL)
+relation admission      ready
+ON table                 verified
+```
+
+另外修正了 `modal-2D-client` 的调用语义：Sidecar 的 `job_id` 是唯一 ID，而不是幂等 request key，因此 `createModal2DAdapter()` 现在为每次 `generateImages()` 调用创建独立 run scope；同一次调用中的候选仍稳定可追踪，不同 Run 不再复用历史中断 job。
